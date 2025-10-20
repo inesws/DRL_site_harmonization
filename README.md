@@ -1,2 +1,2 @@
 # DRL_site_harmonization
-multimodal CNN-AE to integrate brain-environment latent representations, incorporating a DRL strategy for mitigating site effects in the multi-site FC data
+This is the official code repository for "Disentanglement learning to deconfound neuroimaging data: application to multi-site data harmonization in psychiatry" (in update).
