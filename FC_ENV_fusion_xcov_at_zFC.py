@@ -28,10 +28,10 @@ from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, VotingClassifier, VotingRegressor
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 
-data_folder="C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\PRONIA_data_new\\FC_matrices\\"
+data_folder="path\\FC_matrices\\"
 
-info_data="C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\PRONIA_data_new\\pronia_dataset_new.mat"
-diag_labels="C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\PRONIA_data_new\\diag_dummy.mat"
+info_data="path\\info.mat"
+diag_labels="path\\diag_dummy.mat"
 diag_labels=sp.io.loadmat(diag_labels)
 info_data=sp.io.loadmat(info_data)
 
@@ -65,7 +65,7 @@ for i in range(len(FC_matrices)):
 
 
 # random_state = 42 and 24 -> 2x repeated 5-fold CV
-save_results = "C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\new_submission\\FC_ENV_fusion_model_results\\with_fc_z_site_xcov\\"
+save_results = "path\\FC_ENV_fusion_model_results\\with_fc_z_site_xcov\\"
 
 fold_results = pd.DataFrame(np.zeros((11,46)), columns=['epochs','train_loss', 'val_loss', 'val_re_rmse',
                                                         'train_sym_rmse', 'val_sym_rmse',

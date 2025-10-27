@@ -30,15 +30,15 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, Voti
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 
 import sys
-sys.path.insert(0,'C:\\Users\\admin\\Desktop\\Inês\\neurocombat_pyClasse\\combat model')
+sys.path.insert(0,'path\\neurocombat_pyClasse\\combat model')
 import Confounder_Correction_Classes
 from Confounder_Correction_Classes import ComBatHarmonization,StandardScalerDict, BiocovariatesRegression
 
 
-data_folder="C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\PRONIA_data_new\\FC_matrices\\"
+data_folder="path\\FC_matrices\\"
 
-info_data="C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\PRONIA_data_new\\pronia_dataset_new.mat"
-diag_labels="C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\PRONIA_data_new\\diag_dummy.mat"
+info_data="path\\info.mat"
+diag_labels="path\\diag_dummy.mat"
 diag_labels=sp.io.loadmat(diag_labels)
 info_data=sp.io.loadmat(info_data)
 
@@ -68,8 +68,9 @@ FC_matrices=[pd.read_csv(os.path.join(data_folder, subj), delimiter=' ', header=
 stacked_FC_matrices=np.zeros((num_subj, num_ROIs, num_ROIs))
 FC_dataset = np.zeros((num_subj, 12720))
 
+# Flatten and extract upper triangle of NxN FC matrices
 
-for i in range(len(FC_matrices)):
+for i in range(len(FC_matrices)): 
     stacked_FC_matrices[i,:,:]=FC_matrices[i]
     ind=np.flatnonzero(np.triu(FC_matrices[i],k=1))
     FC_dataset[i,:] = np.triu(FC_matrices[i],k=1).flatten()[ind]
@@ -83,7 +84,7 @@ cov_matrix = pd.concat([cov_matrix, labels.idxmax(axis=1)],axis=1).rename({0: 'D
 
 
 # random_state = 42 and 24 -> 2x repeated 5-fold CV
-save_results = "C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\new_submission\\FC_ENV_fusion_model_results\\with_combat\\"
+save_results = "path\\FC_ENV_fusion_model_results\\with_combat\\"
 
 fold_results = pd.DataFrame(np.zeros((11,42)), columns=['epochs','train_loss', 'val_loss', 'val_re_rmse',
                                                         'train_sym_rmse', 'val_sym_rmse',
@@ -125,7 +126,7 @@ for r in range(0,2):
         
         print(i)
         
-        X_train = FC_dataset[train_ind,:]
+        X_train = FC_dataset[train_ind,:] # FC features - not the 2D matrices
         X_val = FC_dataset[val_ind,:]
         
         cov_train=cov_matrix.iloc[train_ind,:].reset_index()
@@ -192,7 +193,8 @@ for r in range(0,2):
         num_classes=y_train_multiclass.shape[1]
         
         
-        ## COMBAT HARMONIZATION
+        ###_______________________ COMBAT HARMONIZATION________________________________
+
         num_feat = X_train.shape[1]
         features = np.arange(0, num_feat)
         
@@ -209,12 +211,12 @@ for r in range(0,2):
         
         X_train_harm = combat.fit_transform(X_train_dict)
         
-        X_val_harm = combat.transform(X_val_dict)
+        X_val_harm = combat.transform(X_val_dict) # We don't fit combat in training set to avoid dataleakage
         
         
         # RECONSTRUCT FC MATRIX
         
-        ## TRaining set 
+        ## Training set 
         
         num_ROI = 160
         n_train = X_train_harm.shape[0]

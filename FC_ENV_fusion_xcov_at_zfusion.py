@@ -29,10 +29,10 @@ from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, VotingClassifier, VotingRegressor
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 
-data_folder="C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\PRONIA_data_new\\FC_matrices\\"
+data_folder="path\\FC_matrices\\"
 
-info_data="C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\PRONIA_data_new\\pronia_dataset_new.mat"
-diag_labels="C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\PRONIA_data_new\\diag_dummy.mat"
+info_data="path\\info.mat"
+diag_labels="path\\diag_dummy.mat"
 diag_labels=sp.io.loadmat(diag_labels)
 info_data=sp.io.loadmat(info_data)
 
@@ -66,7 +66,7 @@ for i in range(len(FC_matrices)):
 
 
 # random_state = 42 and 24 -> 2x repeated 5-fold CV
-save_results = "C:\\Users\\admin\\Desktop\\Inês\\MIICAI\\new_submission\\FC_ENV_fusion_model_results\\with_z2_site_xcov\\"
+save_results = "path\\FC_ENV_fusion_model_results\\with_z2_site_xcov\\"
 
 fold_results = pd.DataFrame(np.zeros((11,46)), columns=['epochs','train_loss', 'val_loss', 'val_re_rmse',
                                                         'train_sym_rmse', 'val_sym_rmse',
@@ -122,7 +122,7 @@ for r in range(0,2):
         labels_train = labels.iloc[train_ind,:]
         labels_val = labels.iloc[val_ind,:]
         
-        BS_withnan_train=BS_withnan[train_ind,:]
+        BS_withnan_train=BS_withnan[train_ind,:] 
         BS_withnan_val = BS_withnan[val_ind,:]
     
         #### Compute environmental risk factor
@@ -160,6 +160,7 @@ for r in range(0,2):
         tf.random.set_seed(seed_value)
     
         ## FC - ENCODER
+
         input_matrix = Input(shape=(160,160,1))
         x = input_matrix
         #x = SpatialDropout2D(0.3, data_format="channels_last", input_shape=(18,18,6))(x)
@@ -473,7 +474,10 @@ for r in range(0,2):
                         batch_size=batch,
                         shuffle=True, 
                         validation_data=([X_val, env_val], y_val_multiclass))
-        ##_______________________________________________________________
+        
+        ###_____________________________ Autoencoder Results _________________________________
+        ###_______Training Evolution__________________________________________________________
+
         
         total_loss = autoencoder_2.history.history['loss']
         fold_results.loc[i, 'train_total_loss'] = total_loss[-1]
@@ -532,7 +536,7 @@ for r in range(0,2):
         plt.legend()
         plt.show()
         
-        ### 
+        ###_______Predict Valid__________________________________________________________
         
         y_train_sites =  pd.DataFrame(y_train_multiclass).idxmax(axis=1).values
         y_val_sites = pd.DataFrame(y_val_multiclass).idxmax(axis=1).values
@@ -551,7 +555,7 @@ for r in range(0,2):
         
         fc_val_decoded = fc_decoder.predict([z_val, y_val_sites_pred])
         
-        #____Site classification based on softmax layer
+        ###_____Site classification based on softmax layer___________________________________
       
         fold_results.loc[i,'softmax_site_auc_roc'] = roc_auc_score(y_val_multiclass, y_val_sites_pred, average='macro',multi_class='ovo')
 
@@ -606,9 +610,10 @@ for r in range(0,2):
         n_train=X_train.shape[0]
         n_val=X_val.shape[0]
         
-        ### CLASSIFICATION CONFOUNDERS APOSTERIORI
+        ###______________CLASSIFICATION CONFOUNDERS APOSTERIORI______________________
         
-        print('ARRIVES HERE')
+        print('CLASSIFICATION APOSTERIORI')
+        
         ## SITE CLASSIFICATION
         
         knn = KNeighborsClassifier(n_neighbors=3)
