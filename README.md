@@ -10,7 +10,7 @@ FC_ENV_fusion_with_combat.py: fusion of brain functional connectivity and enviro
 
 # Requirements
 
-# For combat function used check:
+# For combat function check:
 https://github.com/inesws/neurocombat_pyClasse.git
 
 # Ref:
