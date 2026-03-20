@@ -30,15 +30,15 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, Voti
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 
 import sys
-sys.path.insert(0,'path\\neurocombat_pyClasse\\combat model')
+sys.path.insert(0,'/home/isampaio/Desktop/Ines/DRL_site/neurocombat_pyClasse/combat model/')
 import Confounder_Correction_Classes
-from Confounder_Correction_Classes import ComBatHarmonization,StandardScalerDict, BiocovariatesRegression
+from Confounder_Correction_Classes import ComBatHarmonization, StandardScalerDict, BiocovariatesRegression
 
 
-data_folder="path\\FC_matrices\\"
+data_folder="/mnt/datafast/ines/pronia_fc/FC_matrices/"
 
-info_data="path\\info.mat"
-diag_labels="path\\diag_dummy.mat"
+info_data="/mnt/datafast/ines/pronia_fc/pronia_dataset_new.mat"
+diag_labels="/mnt/datafast/ines/pronia_fc/diag_dummy.mat"
 diag_labels=sp.io.loadmat(diag_labels)
 info_data=sp.io.loadmat(info_data)
 
