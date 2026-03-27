@@ -28,10 +28,6 @@ from sklearn.tree import DecisionTreeRegressor, DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, VotingClassifier, VotingRegressor
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 
-# Set seeds ONCE at the beginning
-SEED = 2020
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
 
 data_folder="/mnt/datafast/ines/pronia_fc/FC_matrices/"
 

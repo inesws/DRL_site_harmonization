@@ -65,7 +65,7 @@ for i in range(len(FC_matrices)):
 
 
 # random_state = 42 and 24 -> 2x repeated 5-fold CV
-save_results = "results/with_fc_z_site_xcov/"
+save_results = "results/abla_xcov_beta_15/"
 
 fold_results = pd.DataFrame(np.zeros((11,46)), columns=['epochs','train_loss', 'val_loss', 'val_re_rmse',
                                                         'train_sym_rmse', 'val_sym_rmse',
@@ -345,10 +345,10 @@ for r in range(0,2):
                             )
                         )
                     
-                    gamma=15
+                    gamma=1 # 15
                    
                     alpha=1
-                    beta=1
+                    beta=15
                     total_loss = alpha*fc_reconstruction_loss  + gamma*xcov_loss + alpha*env_reconstruction_loss 
         
                 print("Shape of y in train_step:", y.shape)
@@ -418,10 +418,10 @@ for r in range(0,2):
                         )
                     )
         
-                gamma=15
+                gamma=1 #15
             
                 alpha=1
-                beta=1
+                beta=15
                 total_loss = alpha*fc_reconstruction_loss + gamma*xcov_loss + alpha*env_reconstruction_loss 
               
                 self.total_loss_tracker.update_state(total_loss)
@@ -916,12 +916,12 @@ for r in range(0,2):
         
         ### Save 
         
-        fold_results.to_csv(os.path.join(save_results, "FC_ENV_fusion_xcov_model.csv"))
+        fold_results.to_csv(os.path.join(save_results, "abla_xcov_beta_15.csv"))
 
 
 
 fold_results.iloc[i+1,:]=fold_results.iloc[0:10,:].mean(axis=0)
 
-fold_results.T.to_csv(os.path.join(save_results, "FC_ENV_fusion_xcov_model.csv"))
+fold_results.T.to_csv(os.path.join(save_results, "abla_xcov_beta_15.csv"))
 
 
