@@ -456,6 +456,7 @@ for r in range(0,2):
         
         autoencoder_2.compile(optimizer_ae=tf.keras.optimizers.Adam(learning_rate=0.0002),
                               optimizer_clf=tf.keras.optimizers.Adam(learning_rate=lrs)) #0.00002 learning_rate=0.00009
+        
         #callback = EarlyStopping(monitor='val_clf_loss', patience = 250, restore_best_weights= True)
         
 
