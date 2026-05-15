@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 HSIC version of the FC+ENV harmonization script.
 
@@ -65,7 +64,7 @@ final_learning_rate = 0.00001
 learning_rate_decay_factor = (final_learning_rate / initial_learning_rate) ** (1 / epochs)
 gamma_hsic = 15 #15
 alpha = 1.0
-
+beta = 1.0
 sigma = None # 0.1 None 
 random_state = [42, 24]
 start = [0, 5]
@@ -232,11 +231,13 @@ def _build_models(num_classes):
         af = "sigmoid"
         loss_sup = tf.keras.losses.BinaryCrossentropy()
 
-    x = tf.keras.layers.Flatten()(h1_layer) #fc_encoded)
+    x = tf.keras.layers.Flatten()(fc_encoded) #(h1_layer) #fc_encoded)
     x = BatchNormalization()(x)
     x = Dropout(0.5)(x)
     supervised_output = Dense(num_classes, activation=af, kernel_regularizer=l2(0.01))(x)
-    FC_encoder = Model(input_matrix, [fc_flatten, h1_layer, supervised_output])
+    #FC_encoder = Model(input_matrix, [fc_flatten, h1_layer, supervised_output])
+    FC_encoder = Model(input_matrix, [fc_flatten, fc_encoded, supervised_output])
+
 
     input_array = Input(shape=(23, 1))
     x = input_array
@@ -296,6 +297,7 @@ class AE(tf.keras.Model):
         self.n_batch_size = n_batch_size
         self.alpha = alpha
         self.gamma = gamma
+        self.beta = beta
 
         self.total_loss_tracker = tf.keras.metrics.Mean(name="loss")
         self.fc_reconstruction_loss_tracker = tf.keras.metrics.Mean(name="fc_reconstruction_loss")
@@ -303,10 +305,10 @@ class AE(tf.keras.Model):
         self.hsic_loss_tracker = tf.keras.metrics.Mean(name="hsic_loss")
         self.clf_loss_tracker = tf.keras.metrics.Mean(name="clf_loss")
 
-    def compile(self, optimizer_ae, optimizer_clf, jit_compile=False):
+    def compile(self, optimizer_ae, jit_compile=False): #optimizer_clf
         super().compile(jit_compile=jit_compile)
         self.optimizer_ae = optimizer_ae
-        self.optimizer_clf = optimizer_clf
+        #self.optimizer_clf = optimizer_clf
 
     @property
     def metrics(self):
@@ -324,6 +326,7 @@ class AE(tf.keras.Model):
 
         with tf.GradientTape() as tape:
             fc_z, _, y_pred = self.FC_encoder(fc, training=True)
+            
             env_z = self.ENV_encoder(env, training=True)
             z = self.fusion([fc_z, env_z], training=True)
             fc_reconstruction = self.fc_decoder([z, y_pred], training=True)
@@ -334,28 +337,29 @@ class AE(tf.keras.Model):
             env_reconstruction_loss = re_loss(env, env_reconstruction)
             clf_loss = self.loss_sup(y, y_pred)
             hsic_loss = _hsic_loss(fc_z, y_pred, sigma)
-            total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.gamma * hsic_loss
+
+            total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss + self.gamma * hsic_loss
 
         grads = tape.gradient(total_loss, self.trainable_weights)
         self.optimizer_ae.apply_gradients(zip(grads, self.trainable_weights))
 
-        with tf.GradientTape() as tape:
-            fc_z, _, y_pred = self.FC_encoder(fc, training=True)
-            env_z = self.ENV_encoder(env, training=True)
-            z = self.fusion([fc_z, env_z], training=True)
-            _ = self.fc_decoder([z, y_pred], training=True)
-            _ = self.env_decoder(z, training=True)
-            clf_loss = self.loss_sup(y, y_pred)
+        #with tf.GradientTape() as tape:
+        #    fc_z, _, y_pred = self.FC_encoder(fc, training=True)
+        #    env_z = self.ENV_encoder(env, training=True)
+        #    z = self.fusion([fc_z, env_z], training=True)
+        #    _ = self.fc_decoder([z, y_pred], training=True)
+        #    _ = self.env_decoder(z, training=True)
+        #   clf_loss = self.loss_sup(y, y_pred)
 
-        clf_vars = self.FC_encoder.trainable_weights
-        grads = tape.gradient(clf_loss, clf_vars)
-        self.optimizer_clf.apply_gradients(zip(grads, clf_vars))
+        #clf_vars = self.FC_encoder.trainable_weights
+        #grads = tape.gradient(clf_loss, clf_vars)
+        #self.optimizer_clf.apply_gradients(zip(grads, clf_vars))
 
-        self.total_loss_tracker.update_state(total_loss)
-        self.fc_reconstruction_loss_tracker.update_state(fc_reconstruction_loss)
-        self.env_reconstruction_loss_tracker.update_state(env_reconstruction_loss)
-        self.hsic_loss_tracker.update_state(hsic_loss)
-        self.clf_loss_tracker.update_state(clf_loss)
+        #self.total_loss_tracker.update_state(total_loss)
+        #self.fc_reconstruction_loss_tracker.update_state(fc_reconstruction_loss)
+        #self.env_reconstruction_loss_tracker.update_state(env_reconstruction_loss)
+        #self.hsic_loss_tracker.update_state(hsic_loss)
+        #self.clf_loss_tracker.update_state(clf_loss)
 
         return {
             "loss": self.total_loss_tracker.result(),
@@ -380,7 +384,7 @@ class AE(tf.keras.Model):
         env_reconstruction_loss = re_loss(env, env_reconstruction)
         clf_loss = self.loss_sup(y, y_pred)
         hsic_loss = _hsic_loss(fc_z, y_pred, sigma)
-        total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.gamma * hsic_loss
+        total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss + self.gamma * hsic_loss
 
         self.total_loss_tracker.update_state(total_loss)
         self.fc_reconstruction_loss_tracker.update_state(fc_reconstruction_loss)
@@ -583,7 +587,7 @@ def main():
 
             autoencoder_2.compile(
                 optimizer_ae=tf.keras.optimizers.Adam(learning_rate=0.0002),
-                optimizer_clf=tf.keras.optimizers.Adam(learning_rate=lrs),
+                #optimizer_clf=tf.keras.optimizers.Adam(learning_rate=lrs),
                 jit_compile=False,
             )
 
@@ -608,12 +612,12 @@ def main():
             train_clf_loss = autoencoder_2.history.history["clf_loss"]
             val_clf_loss = autoencoder_2.history.history["val_clf_loss"]
 
-            fc_train_encoded, h1_train, y_train_sites_pred = FC_encoder.predict(X_train, verbose=0)
+            fc_train_encoded, fc_embedding_train, y_train_sites_pred = FC_encoder.predict(X_train, verbose=0)
             env_train_encoded = ENV_encoder.predict(env_train, verbose=0)
             z_train = fusion.predict([fc_train_encoded, env_train_encoded], verbose=0)
             fc_train_decoded = fc_decoder.predict([z_train, y_train_sites_pred], verbose=0)
 
-            fc_val_encoded, h1_val, y_val_sites_pred = FC_encoder.predict(X_val, verbose=0)
+            fc_val_encoded, fc_embedding_val, y_val_sites_pred = FC_encoder.predict(X_val, verbose=0)
             env_val_encoded = ENV_encoder.predict(env_val, verbose=0)
             z_val = fusion.predict([fc_val_encoded, env_val_encoded], verbose=0)
             fc_val_decoded = fc_decoder.predict([z_val, y_val_sites_pred], verbose=0)
