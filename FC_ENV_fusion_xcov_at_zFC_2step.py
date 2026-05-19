@@ -1,8 +1,8 @@
 """
-HSIC version of the FC+ENV harmonization script.
+xcov version of the FC+ENV harmonization script.
 
 Base architecture is the original XCov script, with:
-- HSIC loss using an RBF kernel
+- xcov loss using an RBF kernel
 - median heuristic for sigma when no fixed sigma is provided
 - MLP predictors for all identifiability tasks
 - convergence tracking for every MLP model
@@ -52,9 +52,9 @@ data_folder = "/mnt/datafast/ines/pronia_fc/FC_matrices/"
 info_data_path = "/mnt/datafast/ines/pronia_fc/pronia_dataset_new.mat"
 diag_labels_path = "/mnt/datafast/ines/pronia_fc/diag_dummy.mat"
 
-save_results = "results/fc_z_site_hsic/"
+save_results = "results/fc_z_site_xcov_15_05_26/"
 os.makedirs(save_results, exist_ok=True)
-output_base_name = "fc_z_site_hsic_h1_gamma50_alphabeta1_szsyMedian_jointopt"
+output_base_name = "fc_z_site_xcov_h1_gamma1_alpha1_beta15_jointopt"
 
 seed_value = 2020
 batch_size = 128
@@ -62,11 +62,9 @@ epochs = 2000
 initial_learning_rate = 0.0001
 final_learning_rate = 0.00001
 learning_rate_decay_factor = (final_learning_rate / initial_learning_rate) ** (1 / epochs)
-gamma_hsic = 50 #15
+gamma_xcov = 1.0 #15
 alpha = 1.0
-beta = 1.0
-sigma_z = None # 0.1 None 
-sigma_y = None # 0.1 None 
+#beta = 15.0
 random_state = [42, 24]
 start = [0, 5]
 
@@ -107,40 +105,26 @@ def _load_data():
 
 
 
-def _rbf_kernel(X, sigma=None, name=""):
-    X = tf.reshape(X, [tf.shape(X)[0], -1])
-    diffs = tf.expand_dims(X, 1) - tf.expand_dims(X, 0)
-    pairwise_sq = tf.reduce_sum(tf.square(diffs), axis=-1)
-    if sigma is None:
-        def _median_sigma_numpy(pairwise_sq_np):
-            values = np.asarray(pairwise_sq_np).reshape(-1)
-            values = values[values > 0.0]
-            if values.size == 0:
-                return np.array(np.sqrt(np.mean(pairwise_sq_np) + 1e-12), dtype=np.float32)
-            return np.array(np.sqrt(np.median(values) + 1e-12), dtype=np.float32)
-
-        sigma = tf.numpy_function(_median_sigma_numpy, [pairwise_sq], tf.float32)
-        sigma.set_shape([])
-    K = tf.exp(-pairwise_sq / (2.0 * sigma**2 + 1e-12))
-
-    # diagnostic prints
-    tf.print(name, "sigma:", sigma, 
-             "K_std:", tf.math.reduce_std(K),
-             "K_mean:", tf.reduce_mean(K))
-
-    return K
-
-
-
-def _hsic_loss(latent, confounder,sigma_y=None, sigma_z=None):
-    latent_centered = latent - tf.reduce_mean(latent, axis=0, keepdims=True)
-    conf_centered = confounder - tf.reduce_mean(confounder, axis=0, keepdims=True)
-    K = _rbf_kernel(latent_centered, sigma_z, name="HSIC_latent")
-    L = _rbf_kernel(conf_centered, sigma_y, name="HSIC_confounder")
-    n = tf.cast(tf.shape(K)[0], tf.float32)
-    H = tf.eye(tf.shape(K)[0]) - tf.ones((tf.shape(K)[0], tf.shape(K)[0])) / n
-    hsic_val = tf.linalg.trace(tf.matmul(tf.matmul(K, H), tf.matmul(L, H))) / ((n - 1.0) ** 2 + 1e-12)
-    return hsic_val
+def _xcov_loss(z, y_pred, n_batch_size):
+    
+    y_pred_mean_over_batches=tf.reduce_mean(y_pred,axis=0, keepdims=True)
+    z_mean_over_batches=tf.reduce_mean(z, axis=0, keepdims=True) # should do the mean over all subjects in batch
+        
+    z_flatten = tf.keras.layers.Flatten()(z-z_mean_over_batches)
+    z_conf_flatten = (y_pred-y_pred_mean_over_batches)
+        
+    #tf.matmul does (n_batch,n_classes)x(n_batch,n_lantent_feat) -> (n_classes, n_latent_feat): each cell in this
+    # matrix has come from (class_11 * feat_11 + class_12 * feat_12 + ... + class_1N * feat_1N )
+    # so each matrix entry is the summation of multiplication of feature i and class i for n_batches 
+    # each cell must be then divided by N_batches
+    xcov_loss = 0.5*tf.reduce_sum(tf.square(tf.matmul(z_conf_flatten,
+                                                      z_flatten,
+                                                      transpose_a=True
+                                                    ) / n_batch_size
+                                           )
+                             )
+                    
+    return xcov_loss
 
 
 
@@ -304,12 +288,12 @@ class AE(tf.keras.Model):
         self.n_batch_size = n_batch_size
         self.alpha = alpha
         self.gamma = gamma
-        self.beta = beta
+        #self.beta = beta
 
         self.total_loss_tracker = tf.keras.metrics.Mean(name="loss")
         self.fc_reconstruction_loss_tracker = tf.keras.metrics.Mean(name="fc_reconstruction_loss")
         self.env_reconstruction_loss_tracker = tf.keras.metrics.Mean(name="env_reconstruction_loss")
-        self.hsic_loss_tracker = tf.keras.metrics.Mean(name="hsic_loss")
+        self.xcov_loss_tracker = tf.keras.metrics.Mean(name="xcov_loss")
         self.clf_loss_tracker = tf.keras.metrics.Mean(name="clf_loss")
 
     def compile(self, optimizer_ae, jit_compile=False): #optimizer_clf
@@ -323,7 +307,7 @@ class AE(tf.keras.Model):
             self.total_loss_tracker,
             self.fc_reconstruction_loss_tracker,
             self.env_reconstruction_loss_tracker,
-            self.hsic_loss_tracker,
+            self.xcov_loss_tracker,
             self.clf_loss_tracker,
         ]
 
@@ -343,36 +327,35 @@ class AE(tf.keras.Model):
             fc_reconstruction_loss = re_loss(fc, fc_reconstruction)
             env_reconstruction_loss = re_loss(env, env_reconstruction)
             clf_loss = self.loss_sup(y, y_pred)
-            hsic_loss = _hsic_loss(fc_z, y_pred, sigma_y, sigma_z)
+            xcov_loss = _xcov_loss(fc_z, y_pred, self.n_batch_size)
 
-            total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss + self.gamma * hsic_loss
+            total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) +  self.gamma * xcov_loss
 
         grads = tape.gradient(total_loss, self.trainable_weights)
         self.optimizer_ae.apply_gradients(zip(grads, self.trainable_weights))
-
-        #with tf.GradientTape() as tape:
-        #    fc_z, _, y_pred = self.FC_encoder(fc, training=True)
-        #    env_z = self.ENV_encoder(env, training=True)
-        #    z = self.fusion([fc_z, env_z], training=True)
-        #    _ = self.fc_decoder([z, y_pred], training=True)
-        #    _ = self.env_decoder(z, training=True)
-        #   clf_loss = self.loss_sup(y, y_pred)
-
-        #clf_vars = self.FC_encoder.trainable_weights
-        #grads = tape.gradient(clf_loss, clf_vars)
-        #self.optimizer_clf.apply_gradients(zip(grads, clf_vars))
-
         self.total_loss_tracker.update_state(total_loss)
         self.fc_reconstruction_loss_tracker.update_state(fc_reconstruction_loss)
         self.env_reconstruction_loss_tracker.update_state(env_reconstruction_loss)
-        self.hsic_loss_tracker.update_state(hsic_loss)
+        self.xcov_loss_tracker.update_state(xcov_loss)
+
+        with tf.GradientTape() as tape:
+            fc_z, _, y_pred = self.FC_encoder(fc, training=True)
+            env_z = self.ENV_encoder(env, training=True)
+            z = self.fusion([fc_z, env_z], training=True)
+            _ = self.fc_decoder([z, y_pred], training=True)
+            _ = self.env_decoder(z, training=True)
+            clf_loss = self.loss_sup(y, y_pred)
+
+        clf_vars = self.FC_encoder.trainable_weights
+        grads = tape.gradient(clf_loss, clf_vars)
+        self.optimizer_clf.apply_gradients(zip(grads, clf_vars))
         self.clf_loss_tracker.update_state(clf_loss)
 
         return {
             "loss": self.total_loss_tracker.result(),
             "fc_reconstruction_loss": self.fc_reconstruction_loss_tracker.result(),
             "env_reconstruction_loss": self.env_reconstruction_loss_tracker.result(),
-            "hsic_loss": self.hsic_loss_tracker.result(),
+            "xcov_loss": self.xcov_loss_tracker.result(),
             "clf_loss": self.clf_loss_tracker.result(),
         }
 
@@ -390,20 +373,20 @@ class AE(tf.keras.Model):
         fc_reconstruction_loss = re_loss(fc, fc_reconstruction)
         env_reconstruction_loss = re_loss(env, env_reconstruction)
         clf_loss = self.loss_sup(y, y_pred)
-        hsic_loss = _hsic_loss(fc_z, y_pred, sigma_z, sigma_y)
-        total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss + self.gamma * hsic_loss
+        xcov_loss = _xcov_loss(fc_z, y_pred, self.n_batch_size)
+        total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) +  self.gamma * xcov_loss
 
         self.total_loss_tracker.update_state(total_loss)
         self.fc_reconstruction_loss_tracker.update_state(fc_reconstruction_loss)
         self.env_reconstruction_loss_tracker.update_state(env_reconstruction_loss)
-        self.hsic_loss_tracker.update_state(hsic_loss)
+        self.xcov_loss_tracker.update_state(xcov_loss)
         self.clf_loss_tracker.update_state(clf_loss)
 
         return {
             "loss": self.total_loss_tracker.result(),
             "fc_reconstruction_loss": self.fc_reconstruction_loss_tracker.result(),
             "env_reconstruction_loss": self.env_reconstruction_loss_tracker.result(),
-            "hsic_loss": self.hsic_loss_tracker.result(),
+            "xcov_loss": self.xcov_loss_tracker.result(),
             "clf_loss": self.clf_loss_tracker.result(),
         }
 
@@ -417,12 +400,12 @@ def main():
         "loss",
         "fc_reconstruction_loss",
         "env_reconstruction_loss",
-        "hsic_loss",
+        "xcov_loss",
         "clf_loss",
         "val_loss",
         "val_fc_reconstruction_loss",
         "val_env_reconstruction_loss",
-        "val_hsic_loss",
+        "val_xcov_loss",
         "val_clf_loss",
         "val_re_rmse",
         "train_sym_rmse",
@@ -589,7 +572,7 @@ def main():
                 loss_sup,
                 batch_size,
                 alpha=alpha,
-                gamma=gamma_hsic,
+                gamma=gamma_xcov,
             )
 
             autoencoder_2.compile(
@@ -614,8 +597,8 @@ def main():
             val_fc_loss = autoencoder_2.history.history["val_fc_reconstruction_loss"]
             train_env_loss = autoencoder_2.history.history["env_reconstruction_loss"]
             val_env_loss = autoencoder_2.history.history["val_env_reconstruction_loss"]
-            train_hsic_loss = autoencoder_2.history.history["hsic_loss"]
-            val_hsic_loss = autoencoder_2.history.history["val_hsic_loss"]
+            train_xcov_loss = autoencoder_2.history.history["xcov_loss"]
+            val_xcov_loss = autoencoder_2.history.history["val_xcov_loss"]
             train_clf_loss = autoencoder_2.history.history["clf_loss"]
             val_clf_loss = autoencoder_2.history.history["val_clf_loss"]
 
@@ -645,10 +628,10 @@ def main():
                 axes[2].legend()
                 axes[2].grid(True, alpha=0.3)
                 
-                axes[3].plot(epochs_range, train_hsic_loss, "b-", label="Train", linewidth=1.5)
-                axes[3].plot(epochs_range, val_hsic_loss, "r-", label="Validation", linewidth=1.5)
-                axes[3].set_ylabel("HSIC Loss")
-                axes[3].set_title(f"HSIC Loss - Fold {fold_idx}")
+                axes[3].plot(epochs_range, train_xcov_loss, "b-", label="Train", linewidth=1.5)
+                axes[3].plot(epochs_range, val_xcov_loss, "r-", label="Validation", linewidth=1.5)
+                axes[3].set_ylabel("XCov Loss")
+                axes[3].set_title(f"XCov Loss - Fold {fold_idx}")
                 axes[3].legend()
                 axes[3].grid(True, alpha=0.3)
                 
@@ -667,12 +650,12 @@ def main():
                 print(f"Saved loss plot: {plot_path}")
 
 
-            fc_train_encoded, fc_embedding_train, y_train_sites_pred = FC_encoder.predict(X_train, verbose=0)
+            fc_train_encoded, h1_train, y_train_sites_pred = FC_encoder.predict(X_train, verbose=0)
             env_train_encoded = ENV_encoder.predict(env_train, verbose=0)
             z_train = fusion.predict([fc_train_encoded, env_train_encoded], verbose=0)
             fc_train_decoded = fc_decoder.predict([z_train, y_train_sites_pred], verbose=0)
 
-            fc_val_encoded, fc_embedding_val, y_val_sites_pred = FC_encoder.predict(X_val, verbose=0)
+            fc_val_encoded, h1_val, y_val_sites_pred = FC_encoder.predict(X_val, verbose=0)
             env_val_encoded = ENV_encoder.predict(env_val, verbose=0)
             z_val = fusion.predict([fc_val_encoded, env_val_encoded], verbose=0)
             fc_val_decoded = fc_decoder.predict([z_val, y_val_sites_pred], verbose=0)
@@ -686,12 +669,12 @@ def main():
             fold_result["loss"] = train_loss[-1]
             fold_result["fc_reconstruction_loss"] = train_fc_loss[-1]
             fold_result["env_reconstruction_loss"] = train_env_loss[-1]
-            fold_result["hsic_loss"] = train_hsic_loss[-1]
+            fold_result["xcov_loss"] = train_xcov_loss[-1]
             fold_result["clf_loss"] = train_clf_loss[-1]
             fold_result["val_loss"] = val_loss[-1]
             fold_result["val_fc_reconstruction_loss"] = val_fc_loss[-1]
             fold_result["val_env_reconstruction_loss"] = val_env_loss[-1]
-            fold_result["val_hsic_loss"] = val_hsic_loss[-1]
+            fold_result["val_xcov_loss"] = val_xcov_loss[-1]
             fold_result["val_clf_loss"] = val_clf_loss[-1]
 
             X_val_flatten = X_val.reshape(X_val.shape[0], -1)

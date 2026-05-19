@@ -52,9 +52,9 @@ data_folder = "/mnt/datafast/ines/pronia_fc/FC_matrices/"
 info_data_path = "/mnt/datafast/ines/pronia_fc/pronia_dataset_new.mat"
 diag_labels_path = "/mnt/datafast/ines/pronia_fc/diag_dummy.mat"
 
-save_results = "results/fc_z_site_hsic/"
+save_results = "results/fc_z_site_mmd/"
 os.makedirs(save_results, exist_ok=True)
-output_base_name = "fc_z_site_hsic_h1_gamma50_alphabeta1_szsyMedian_jointopt"
+output_base_name = "fc_z_site_mmd_h1_gamma50_alphabeta1_szsyMedian_jointopt"
 
 seed_value = 2020
 batch_size = 128
@@ -132,15 +132,54 @@ def _rbf_kernel(X, sigma=None, name=""):
 
 
 
-def _hsic_loss(latent, confounder,sigma_y=None, sigma_z=None):
-    latent_centered = latent - tf.reduce_mean(latent, axis=0, keepdims=True)
-    conf_centered = confounder - tf.reduce_mean(confounder, axis=0, keepdims=True)
-    K = _rbf_kernel(latent_centered, sigma_z, name="HSIC_latent")
-    L = _rbf_kernel(conf_centered, sigma_y, name="HSIC_confounder")
-    n = tf.cast(tf.shape(K)[0], tf.float32)
-    H = tf.eye(tf.shape(K)[0]) - tf.ones((tf.shape(K)[0], tf.shape(K)[0])) / n
-    hsic_val = tf.linalg.trace(tf.matmul(tf.matmul(K, H), tf.matmul(L, H))) / ((n - 1.0) ** 2 + 1e-12)
-    return hsic_val
+
+def _mmd_loss(latent, site_labels, sigma=None, name="MMD"):
+    """
+    Maximum Mean Discrepancy loss between latent distributions across site groups.
+    MMD²(X, Y) = E[k(X,X)] + E[k(Y,Y)] - 2*E[k(X,Y)]
+    """
+    def mmd_loss_py(latent_np, site_labels_np, sigma_val):
+        """Compute MMD loss in numpy for efficiency"""
+        site_indices = np.argmax(site_labels_np, axis=1)
+        unique_sites = np.unique(site_indices)
+        
+        # Compute sigma if not provided
+        if sigma_val is None:
+            dists = np.linalg.norm(latent_np[:, np.newaxis, :] - latent_np[np.newaxis, :, :], axis=-1)
+            sigma_val = np.median(dists[dists > 0]) if np.any(dists > 0) else 1.0
+        
+        def rbf_kernel(x, y):
+            sq_dists = np.sum((x[:, np.newaxis, :] - y[np.newaxis, :, :]) ** 2, axis=-1)
+            return np.exp(-sq_dists / (2.0 * sigma_val ** 2 + 1e-8))
+        
+        mmd_value = 0.0
+        pair_count = 0
+        
+        for i in range(len(unique_sites) - 1):
+            for j in range(i + 1, len(unique_sites)):
+                site_i = unique_sites[i]
+                site_j = unique_sites[j]
+                X_i = latent_np[site_indices == site_i]
+                X_j = latent_np[site_indices == site_j]
+                
+                if len(X_i) > 0 and len(X_j) > 0:
+                    K_XX = rbf_kernel(X_i, X_i)
+                    K_YY = rbf_kernel(X_j, X_j)
+                    K_XY = rbf_kernel(X_i, X_j)
+                    mmd = np.mean(K_XX) + np.mean(K_YY) - 2 * np.mean(K_XY)
+                    mmd_value += max(mmd, 0.0)
+                    pair_count += 1
+        
+        if pair_count == 0:
+            return np.float32(0.0)
+        return np.float32(mmd_value / pair_count)
+    
+    # Use py_function to execute the numpy computation
+    mmd_val = tf.py_function(mmd_loss_py, [latent, site_labels, sigma], tf.float32)
+    mmd_val.set_shape([])  # Scalar output
+    return mmd_val
+
+
 
 
 
@@ -309,7 +348,7 @@ class AE(tf.keras.Model):
         self.total_loss_tracker = tf.keras.metrics.Mean(name="loss")
         self.fc_reconstruction_loss_tracker = tf.keras.metrics.Mean(name="fc_reconstruction_loss")
         self.env_reconstruction_loss_tracker = tf.keras.metrics.Mean(name="env_reconstruction_loss")
-        self.hsic_loss_tracker = tf.keras.metrics.Mean(name="hsic_loss")
+        self.mmd_loss_tracker = tf.keras.metrics.Mean(name="mmd_loss")
         self.clf_loss_tracker = tf.keras.metrics.Mean(name="clf_loss")
 
     def compile(self, optimizer_ae, jit_compile=False): #optimizer_clf
@@ -323,7 +362,7 @@ class AE(tf.keras.Model):
             self.total_loss_tracker,
             self.fc_reconstruction_loss_tracker,
             self.env_reconstruction_loss_tracker,
-            self.hsic_loss_tracker,
+            self.mmd_loss_tracker,
             self.clf_loss_tracker,
         ]
 
@@ -343,9 +382,9 @@ class AE(tf.keras.Model):
             fc_reconstruction_loss = re_loss(fc, fc_reconstruction)
             env_reconstruction_loss = re_loss(env, env_reconstruction)
             clf_loss = self.loss_sup(y, y_pred)
-            hsic_loss = _hsic_loss(fc_z, y_pred, sigma_y, sigma_z)
+            mmd_loss = _mmd_loss(fc_z, y_pred, sigma=sigma_z)
 
-            total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss + self.gamma * hsic_loss
+            total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss + self.gamma * mmd_loss
 
         grads = tape.gradient(total_loss, self.trainable_weights)
         self.optimizer_ae.apply_gradients(zip(grads, self.trainable_weights))
@@ -365,14 +404,14 @@ class AE(tf.keras.Model):
         self.total_loss_tracker.update_state(total_loss)
         self.fc_reconstruction_loss_tracker.update_state(fc_reconstruction_loss)
         self.env_reconstruction_loss_tracker.update_state(env_reconstruction_loss)
-        self.hsic_loss_tracker.update_state(hsic_loss)
+        self.mmd_loss_tracker.update_state(mmd_loss)
         self.clf_loss_tracker.update_state(clf_loss)
 
         return {
             "loss": self.total_loss_tracker.result(),
             "fc_reconstruction_loss": self.fc_reconstruction_loss_tracker.result(),
             "env_reconstruction_loss": self.env_reconstruction_loss_tracker.result(),
-            "hsic_loss": self.hsic_loss_tracker.result(),
+            "mmd_loss": self.mmd_loss_tracker.result(),
             "clf_loss": self.clf_loss_tracker.result(),
         }
 
@@ -390,20 +429,20 @@ class AE(tf.keras.Model):
         fc_reconstruction_loss = re_loss(fc, fc_reconstruction)
         env_reconstruction_loss = re_loss(env, env_reconstruction)
         clf_loss = self.loss_sup(y, y_pred)
-        hsic_loss = _hsic_loss(fc_z, y_pred, sigma_z, sigma_y)
-        total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss + self.gamma * hsic_loss
+        mmd_loss = _mmd_loss(fc_z, y_pred, sigma=sigma_z)
+        total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss + self.gamma * mmd_loss
 
         self.total_loss_tracker.update_state(total_loss)
         self.fc_reconstruction_loss_tracker.update_state(fc_reconstruction_loss)
         self.env_reconstruction_loss_tracker.update_state(env_reconstruction_loss)
-        self.hsic_loss_tracker.update_state(hsic_loss)
+        self.mmd_loss_tracker.update_state(mmd_loss)
         self.clf_loss_tracker.update_state(clf_loss)
 
         return {
             "loss": self.total_loss_tracker.result(),
             "fc_reconstruction_loss": self.fc_reconstruction_loss_tracker.result(),
             "env_reconstruction_loss": self.env_reconstruction_loss_tracker.result(),
-            "hsic_loss": self.hsic_loss_tracker.result(),
+            "mmd_loss": self.mmd_loss_tracker.result(),
             "clf_loss": self.clf_loss_tracker.result(),
         }
 
@@ -417,12 +456,12 @@ def main():
         "loss",
         "fc_reconstruction_loss",
         "env_reconstruction_loss",
-        "hsic_loss",
+        "mmd_loss",
         "clf_loss",
         "val_loss",
         "val_fc_reconstruction_loss",
         "val_env_reconstruction_loss",
-        "val_hsic_loss",
+        "val_mmd_loss",
         "val_clf_loss",
         "val_re_rmse",
         "train_sym_rmse",

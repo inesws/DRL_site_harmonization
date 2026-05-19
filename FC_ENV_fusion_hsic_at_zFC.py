@@ -811,7 +811,7 @@ def main():
                     print(f"ERROR in {prefix} voting Age regression (fold {fold_idx}): {e}")
                     traceback.print_exc()
                 try:
-                    _, y_pred, rmse = _fit_mlp_regressor(
+                    _, y_pred, _ = _fit_mlp_regressor(
                         Xtr,
                         cov_train[:, 0],
                         Xva,
@@ -821,7 +821,7 @@ def main():
                         hidden_layers=(128, 64),
                         max_iter=500,
                     )
-                    fold_result[f"{prefix}_Age_mlp_rmse"] = rmse
+                    fold_result[f"{prefix}_Age_mlp_rmse"] = mean_squared_error(cov_val[:, 0].ravel(), y_pred, squared=False)
                 except Exception as e:
                     print(f"ERROR in {prefix} MLP Age regression (fold {fold_idx}): {e}")
                     traceback.print_exc()
