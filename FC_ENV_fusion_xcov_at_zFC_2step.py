@@ -54,7 +54,7 @@ diag_labels_path = "/mnt/datafast/ines/pronia_fc/diag_dummy.mat"
 
 save_results = "results/fc_z_site_xcov_15_05_26/"
 os.makedirs(save_results, exist_ok=True)
-output_base_name = "fc_z_site_xcov_h1_gamma1_alpha1_beta15_jointopt"
+output_base_name = "fc_z_site_xcov_h1_gamma1_alpha15_2step"
 
 seed_value = 2020
 batch_size = 128
@@ -63,7 +63,7 @@ initial_learning_rate = 0.0001
 final_learning_rate = 0.00001
 learning_rate_decay_factor = (final_learning_rate / initial_learning_rate) ** (1 / epochs)
 gamma_xcov = 1.0 #15
-alpha = 1.0
+alpha = 15.0
 #beta = 15.0
 random_state = [42, 24]
 start = [0, 5]
@@ -296,10 +296,10 @@ class AE(tf.keras.Model):
         self.xcov_loss_tracker = tf.keras.metrics.Mean(name="xcov_loss")
         self.clf_loss_tracker = tf.keras.metrics.Mean(name="clf_loss")
 
-    def compile(self, optimizer_ae, jit_compile=False): #optimizer_clf
+    def compile(self, optimizer_ae,  optimizer_clf, jit_compile=False): #optimizer_clf
         super().compile(jit_compile=jit_compile)
         self.optimizer_ae = optimizer_ae
-        #self.optimizer_clf = optimizer_clf
+        self.optimizer_clf = optimizer_clf
 
     @property
     def metrics(self):
@@ -577,7 +577,7 @@ def main():
 
             autoencoder_2.compile(
                 optimizer_ae=tf.keras.optimizers.Adam(learning_rate=0.0002),
-                #optimizer_clf=tf.keras.optimizers.Adam(learning_rate=lrs),
+                optimizer_clf=tf.keras.optimizers.Adam(learning_rate=lrs),
                 jit_compile=False,
             )
 
