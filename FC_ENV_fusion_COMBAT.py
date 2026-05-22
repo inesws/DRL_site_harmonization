@@ -46,6 +46,7 @@ from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 
 import sys
+
 sys.path.insert(0,'/home/isampaio/Desktop/Ines/DRL_site/neurocombat_pyClasse/combat model/')
 import Confounder_Correction_Classes
 from Confounder_Correction_Classes import ComBatHarmonization, StandardScalerDict, BiocovariatesRegression
@@ -57,7 +58,10 @@ diag_labels_path = "/mnt/datafast/ines/pronia_fc/diag_dummy.mat"
 
 save_results = "results/fc_z_site_xcov_15_05_26/"
 os.makedirs(save_results, exist_ok=True)
-output_base_name = "fc_z_site_combat"
+
+output_base_name = "fc_z_site_combat_without_cov"
+use_combat_without_cov = True # If True, we fit combat without covariates 
+
 
 seed_value = 2020
 batch_size = 128
@@ -98,10 +102,14 @@ def _load_data():
     ]
 
     stacked_fc_matrices = np.zeros((num_subj, num_rois, num_rois), dtype=np.float32)
+    FC_dataset = np.zeros((num_subj, 12720))
+
     for i, mat in enumerate(fc_matrices[:num_subj]):
         stacked_fc_matrices[i, :, :] = mat
+        ind=np.flatnonzero(np.triu(fc_matrices[i],k=1))
+        FC_dataset[i,:] = np.triu(fc_matrices[i],k=1).flatten()[ind]
 
-    return stacked_fc_matrices, covariates, labels, envir, bs_with_nan
+    return stacked_fc_matrices, FC_dataset, covariates, labels, envir, bs_with_nan
 
 
 
@@ -334,14 +342,14 @@ class AE(tf.keras.Model):
 
 
 def main():
-    stacked_fc_matrices, covariates, labels, envir, bs_with_nan = _load_data()
+    stacked_fc_matrices, fc_dataset, covariates, labels, envir, bs_with_nan = _load_data()
 
     sites_array = pd.DataFrame(covariates[:,3:]).idxmax(axis=1)
 
     # Name the covariates columns
     cov_matrix = pd.DataFrame(covariates[:,0:3],columns=['Age', 'Sex', 'Education'])
     cov_matrix = pd.concat([cov_matrix, sites_array],axis=1).rename({0: 'batch'},axis=1)
-    covariates = pd.concat([cov_matrix, labels.idxmax(axis=1)],axis=1).rename({0: 'Diagn'},axis=1) #.rename({0: 'HC', 1: 'CHR', 2: 'ROD', 3: 'ROP'},axis=1)
+    cov_matrix = pd.concat([cov_matrix, labels.idxmax(axis=1)],axis=1).rename({0: 'Diagn'},axis=1) #.rename({0: 'HC', 1: 'CHR', 2: 'ROD', 3: 'ROP'},axis=1)
 
 
     result_columns = [
@@ -349,13 +357,9 @@ def main():
         "loss",
         "fc_reconstruction_loss",
         "env_reconstruction_loss",
-        "xcov_loss",
-        "clf_loss",
         "val_loss",
         "val_fc_reconstruction_loss",
         "val_env_reconstruction_loss",
-        "val_xcov_loss",
-        "val_clf_loss",
         "val_re_rmse",
         "train_sym_rmse",
         "val_sym_rmse",
@@ -472,14 +476,18 @@ def main():
             fold_idx = start[r] + i
             print(fold_idx)
 
-            X_train = stacked_fc_matrices[train_ind, :, :]
-            X_val = stacked_fc_matrices[val_ind, :, :]
-            cov_train = covariates[train_ind, :]
-            cov_val = covariates[val_ind, :]
+            X_train = fc_dataset[train_ind, :]
+            X_val = fc_dataset[val_ind, :]
+
+            cov_train = cov_matrix.iloc[train_ind, :].reset_index()
+            cov_val = cov_matrix.iloc[val_ind, :].reset_index()
+
             env_train = envir[train_ind, :].copy()
             env_val = envir[val_ind, :].copy()
+
             labels_train = labels.iloc[train_ind, :]
             labels_val = labels.iloc[val_ind, :]
+
             bs_train = bs_with_nan[train_ind, :].copy()
             bs_val = bs_with_nan[val_ind, :].copy()
 
@@ -499,7 +507,7 @@ def main():
             # Validation set
             cov_val = cov_val.sort_values('batch')
             val_combat_order = list(cov_val.index) # The list of original indexes in the new sorted order
-            y_val_sites = cov_val['batch'].values
+            y_val_sites = cov_val['batch'].values.astype(str)
             cov_val.reset_index(inplace=True)
             env_val = env_val[val_combat_order, :]
             labels_val = labels_val.iloc[val_combat_order, :].reset_index(drop=True)
@@ -517,16 +525,23 @@ def main():
             train_env_risk = np.sum(env_train, axis=1) / max_score_per_subject
             val_env_risk = np.sum(env_val, axis=1) / max_score_per_subject
 
-            y_train_multiclass = cov_train[:, 3:].copy()
-            y_val_multiclass = cov_val[:, 3:].copy()
+            y_train_multiclass = pd.get_dummies(cov_train, columns=['batch'], drop_first=False, dtype=int).iloc[:,6:].copy()
+            y_val_multiclass = pd.get_dummies(cov_val, columns=['batch'], drop_first=False, dtype=int).iloc[:,6:].copy()
+
             num_classes = y_train_multiclass.shape[1]
 
             ###_______________________ COMBAT HARMONIZATION________________________________
 
             num_feat = X_train.shape[1]
             features = np.arange(0, num_feat)
-        
-            feat_to_harm = {'fc': {'id': features, 'categorical': ['Sex'],
+
+            if use_combat_without_cov==True:
+
+                feat_to_harm = {'fc': {'id': features, 'categorical': [],
+                               'continuous': []}}
+
+            else:
+                feat_to_harm = {'fc': {'id': features, 'categorical': ['Sex', 'Diagn_0'],
                                'continuous': ['Age']}}
         
             combat = ComBatHarmonization(cv_method=None, ref_batch=None, 
@@ -681,8 +696,8 @@ def main():
             z_val = fusion.predict([fc_val_encoded, env_val_encoded], verbose=0)
             fc_val_decoded = fc_decoder.predict(z_val, verbose=0)
 
-            y_train_sites = pd.DataFrame(y_train_multiclass).idxmax(axis=1).values
-            y_val_sites = pd.DataFrame(y_val_multiclass).idxmax(axis=1).values
+            y_train_sites = pd.DataFrame(y_train_multiclass.to_numpy()).idxmax(axis=1).values
+            y_val_sites =  pd.DataFrame(y_val_multiclass.to_numpy()).idxmax(axis=1).values
             sites = np.unique(y_train_sites)
 
             fold_result = {column: np.nan for column in result_columns}
@@ -731,12 +746,18 @@ def main():
                         hidden_layers=(128,),
                         max_iter=300,
                     )
-                    auc, f1 = _safe_auc_f1_multiclass(y_val_multiclass, y_prob, sites)
+                    auc, f1 = _safe_auc_f1_multiclass(y_val_multiclass.to_numpy(), y_prob, sites)
                     fold_result[f"{prefix}_site_mlp_auc_roc"] = auc
                     fold_result[f"{prefix}_site_mlp_f1"] = f1
                 except Exception as e:
                     print(f"ERROR in {prefix} MLP site classification (fold {fold_idx}): {e}")
                     traceback.print_exc()
+                    raise  # This stops the script
+                    
+
+            # Transform cov to numpy
+            cov_train = cov_train.iloc[:,2:].to_numpy()
+            cov_val = cov_val.iloc[:,2:].to_numpy()
 
             # Sex classification
             y_train_binary = cov_train[:, 1].astype("float32").reshape((-1, 1))
