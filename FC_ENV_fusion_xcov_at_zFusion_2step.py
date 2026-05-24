@@ -52,9 +52,9 @@ data_folder = "/mnt/datafast/ines/pronia_fc/FC_matrices/"
 info_data_path = "/mnt/datafast/ines/pronia_fc/pronia_dataset_new.mat"
 diag_labels_path = "/mnt/datafast/ines/pronia_fc/diag_dummy.mat"
 
-save_results = "results/fc_z_site_xcov_15_05_26/"
+save_results = "results/fusion_z_site_xcov_15_05_26/"
 os.makedirs(save_results, exist_ok=True)
-output_base_name = "fc_z_site_xcov_h1_gamma100_alpha1_2step"
+output_base_name = "fusion_z_site_xcov_h1_gamma50_alpha1_2step"
 
 seed_value = 2020
 batch_size = 128
@@ -62,7 +62,7 @@ epochs = 2000
 initial_learning_rate = 0.0001
 final_learning_rate = 0.00001
 learning_rate_decay_factor = (final_learning_rate / initial_learning_rate) ** (1 / epochs)
-gamma_xcov = 100.0 #15
+gamma_xcov = 50.0 #15
 alpha = 1.0
 #beta = 15.0
 random_state = [42, 24]
@@ -210,24 +210,13 @@ def _build_models(num_classes):
     x = Conv2D(32, (3, 3), activation="selu", kernel_initializer="lecun_normal", padding="same")(x)
     x = MaxPooling2D((2, 2), padding="same")(x)
     x = Conv2D(64, (3, 3), activation="selu", kernel_initializer="lecun_normal", padding="same")(x)
-    h1_layer = MaxPooling2D((2, 2), padding="same")(x)
-    x = Conv2D(128, (3, 3), strides=1, activation="selu", kernel_initializer="lecun_normal", padding="same")(h1_layer)
+    x = MaxPooling2D((2, 2), padding="same")(x)
+    x = Conv2D(128, (3, 3), strides=1, activation="selu", kernel_initializer="lecun_normal", padding="same")(x)
     fc_encoded = MaxPooling2D((4, 4), padding="same")(x)
     fc_flatten = tf.keras.layers.Flatten()(fc_encoded)
 
-    if num_classes > 1:
-        af = "softmax"
-        loss_sup = tf.keras.losses.CategoricalCrossentropy()
-    else:
-        af = "sigmoid"
-        loss_sup = tf.keras.losses.BinaryCrossentropy()
-
-    x = tf.keras.layers.Flatten()(h1_layer) #fc_encoded)
-    x = BatchNormalization()(x)
-    x = Dropout(0.5)(x)
-    supervised_output = Dense(num_classes, activation=af, kernel_regularizer=l2(0.01))(x)
-    FC_encoder = Model(input_matrix, [fc_flatten, h1_layer, supervised_output])
-    #FC_encoder = Model(input_matrix, [fc_flatten, fc_encoded, supervised_output])
+    FC_encoder = Model(input_matrix, fc_flatten)
+    FC_encoder.summary()
 
 
     input_array = Input(shape=(23, 1))
@@ -242,11 +231,27 @@ def _build_models(num_classes):
 
     env_input = Input(shape=(env_flatten.shape[1],))
     fc_input = Input(shape=(fc_flatten.shape[1],))
+
     concat_flatten = Concatenate(axis=1)([fc_input, env_input])
-    x = Dense(256, activation="selu", kernel_initializer="lecun_normal")(concat_flatten)
-    x = Dropout(0.3)(x)
+    h1_layer = Dense(256, activation="selu", kernel_initializer="lecun_normal")(concat_flatten)
+    x = Dropout(0.3)(h1_layer)
     z_merged = Dense(128, activation="selu", kernel_initializer="lecun_normal")(x)
-    fusion = Model([fc_input, env_input], z_merged, name="fusion_branch")
+
+    if num_classes > 1:
+        af = "softmax"
+        loss_sup = tf.keras.losses.CategoricalCrossentropy()
+    else:
+        af = "sigmoid"
+        loss_sup = tf.keras.losses.BinaryCrossentropy()
+
+    x = tf.keras.layers.Flatten()(h1_layer) #fc_encoded)
+    x = BatchNormalization()(x)
+    x = Dropout(0.5)(x)
+    supervised_output = Dense(num_classes, activation=af, kernel_regularizer=l2(0.01))(x)
+    
+    fusion = Model([fc_input,env_input], [z_merged, h1_layer, supervised_output], name="fusion_branch")
+    fusion.summary()
+
 
     latent_inputs = Input(shape=(z_merged.shape[1],), name="z_merged_latent_inputs")
     y_hat_inputs = Input(shape=(num_classes,), name="y_inputs")
@@ -264,14 +269,16 @@ def _build_models(num_classes):
     fc_decoder = Model([latent_inputs, y_hat_inputs], decoded, name="decoded")
 
     latent_inputs = Input(shape=(z_merged.shape[1],), name="z_merged_latent_inputs")
-    x = Dense(120, activation="selu", kernel_initializer="lecun_normal")(latent_inputs)
+    y_hat_inputs = Input(shape=(num_classes,), name='y_inputs')
+    concat_inputs = Concatenate(axis=1)([latent_inputs, y_hat_inputs ])
+    x = Dense(120, activation="selu", kernel_initializer="lecun_normal")(concat_inputs)
     x = Reshape((6, 20))(x)
     x = UpSampling1D(size=2)(x)
     x = Conv1D(20, 5, activation="selu", kernel_initializer="lecun_normal", strides=1, padding="same")(x)
     x = BatchNormalization()(x)
     x = Conv1DTranspose(1, 7, activation="selu", kernel_initializer="lecun_normal", strides=2, padding="same")(x)
     env_decoded = Cropping1D((0, 1))(x)
-    env_decoder = Model(latent_inputs, env_decoded, name="env_decoded")
+    env_decoder = Model([latent_inputs, y_hat_inputs], env_decoded, name="env_decoded")
 
     return FC_encoder, ENV_encoder, fusion, fc_decoder, env_decoder, loss_sup
 
@@ -316,18 +323,21 @@ class AE(tf.keras.Model):
         fc, env = x
 
         with tf.GradientTape() as tape:
-            fc_z, _, y_pred = self.FC_encoder(fc, training=True)
-            
+
+            fc_z  = self.FC_encoder(fc, training=True)
             env_z = self.ENV_encoder(env, training=True)
-            z = self.fusion([fc_z, env_z], training=True)
+            z, _ ,y_pred = self.fusion([fc_z, env_z], training=True)
+
             fc_reconstruction = self.fc_decoder([z, y_pred], training=True)
-            env_reconstruction = self.env_decoder(z, training=True)
+            env_reconstruction = self.env_decoder([z, y_pred], training=True)
 
             re_loss = tf.keras.losses.MeanSquaredError(reduction="sum_over_batch_size")
             fc_reconstruction_loss = re_loss(fc, fc_reconstruction)
             env_reconstruction_loss = re_loss(env, env_reconstruction)
+
             clf_loss = self.loss_sup(y, y_pred)
-            xcov_loss = _xcov_loss(fc_z, y_pred, self.n_batch_size)
+
+            xcov_loss = _xcov_loss(z, y_pred, self.n_batch_size)
 
             total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) +  self.gamma * xcov_loss
 
@@ -339,14 +349,14 @@ class AE(tf.keras.Model):
         self.xcov_loss_tracker.update_state(xcov_loss)
 
         with tf.GradientTape() as tape:
-            fc_z, _, y_pred = self.FC_encoder(fc, training=True)
+            fc_z  = self.FC_encoder(fc, training=True)
             env_z = self.ENV_encoder(env, training=True)
-            z = self.fusion([fc_z, env_z], training=True)
+            z, _ ,y_pred = self.fusion([fc_z, env_z], training=True)
             _ = self.fc_decoder([z, y_pred], training=True)
-            _ = self.env_decoder(z, training=True)
+            _ = self.env_decoder([z, y_pred], training=True)
             clf_loss = self.loss_sup(y, y_pred)
 
-        clf_vars = self.FC_encoder.trainable_weights
+        clf_vars = self.fusion.trainable_weights
         grads = tape.gradient(clf_loss, clf_vars)
         self.optimizer_clf.apply_gradients(zip(grads, clf_vars))
         self.clf_loss_tracker.update_state(clf_loss)
@@ -363,17 +373,19 @@ class AE(tf.keras.Model):
         x, y = data
         fc, env = x
 
-        fc_z, _, y_pred = self.FC_encoder(fc, training=False)
+        fc_z  = self.FC_encoder(fc, training=False)
         env_z = self.ENV_encoder(env, training=False)
-        z = self.fusion([fc_z, env_z], training=False)
+        z, _ ,y_pred = self.fusion([fc_z, env_z], training=False)
         fc_reconstruction = self.fc_decoder([z, y_pred], training=False)
-        env_reconstruction = self.env_decoder(z, training=False)
+        env_reconstruction = self.env_decoder([z, y_pred], training=False)
 
         re_loss = tf.keras.losses.MeanSquaredError(reduction="sum_over_batch_size")
         fc_reconstruction_loss = re_loss(fc, fc_reconstruction)
         env_reconstruction_loss = re_loss(env, env_reconstruction)
+
         clf_loss = self.loss_sup(y, y_pred)
-        xcov_loss = _xcov_loss(fc_z, y_pred, self.n_batch_size)
+
+        xcov_loss = _xcov_loss(z, y_pred, self.n_batch_size)
         total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) +  self.gamma * xcov_loss
 
         self.total_loss_tracker.update_state(total_loss)
@@ -650,14 +662,16 @@ def main():
                 print(f"Saved loss plot: {plot_path}")
 
 
-            fc_train_encoded, h1_train, y_train_sites_pred = FC_encoder.predict(X_train, verbose=0)
+            fc_train_encoded = FC_encoder.predict(X_train, verbose=0)
             env_train_encoded = ENV_encoder.predict(env_train, verbose=0)
-            z_train = fusion.predict([fc_train_encoded, env_train_encoded], verbose=0)
+            z_train, h1_train, y_train_sites_pred = fusion.predict([fc_train_encoded, env_train_encoded], verbose=0)
+
             fc_train_decoded = fc_decoder.predict([z_train, y_train_sites_pred], verbose=0)
 
-            fc_val_encoded, h1_val, y_val_sites_pred = FC_encoder.predict(X_val, verbose=0)
+            fc_val_encoded  = FC_encoder.predict(X_val, verbose=0)
             env_val_encoded = ENV_encoder.predict(env_val, verbose=0)
-            z_val = fusion.predict([fc_val_encoded, env_val_encoded], verbose=0)
+            z_val, h1_val, y_val_sites_pred = fusion.predict([fc_val_encoded, env_val_encoded], verbose=0)
+            
             fc_val_decoded = fc_decoder.predict([z_val, y_val_sites_pred], verbose=0)
 
             y_train_sites = pd.DataFrame(y_train_multiclass).idxmax(axis=1).values
