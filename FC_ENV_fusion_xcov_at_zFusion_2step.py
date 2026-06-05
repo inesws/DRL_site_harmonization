@@ -54,7 +54,7 @@ diag_labels_path = "/mnt/datafast/ines/pronia_fc/diag_dummy.mat"
 
 save_results = "results/fusion_z_site_xcov_15_05_26/"
 os.makedirs(save_results, exist_ok=True)
-output_base_name = "fusion_z_site_xcov_h1_gamma50_alpha1_2step"
+output_base_name = "fusion_z_site_xcov_h1_gamma100_alpha1_2step"
 
 seed_value = 2020
 batch_size = 128
@@ -62,7 +62,7 @@ epochs = 2000
 initial_learning_rate = 0.0001
 final_learning_rate = 0.00001
 learning_rate_decay_factor = (final_learning_rate / initial_learning_rate) ** (1 / epochs)
-gamma_xcov = 50.0 #15
+gamma_xcov = 100.0 #15
 alpha = 1.0
 #beta = 15.0
 random_state = [42, 24]

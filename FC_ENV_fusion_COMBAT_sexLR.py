@@ -1,9 +1,6 @@
 """
-xcov version of the FC+ENV harmonization script.
+baseline FC+ENV harmonization script.
 
-Base architecture is the original XCov script, with:
-- xcov loss using an RBF kernel
-- median heuristic for sigma when no fixed sigma is provided
 - MLP predictors for all identifiability tasks
 - convergence tracking for every MLP model
 - separate CSV exports for main results, MLP results, and convergence summary
@@ -14,6 +11,7 @@ import numpy as np
 import scipy as sp
 import scipy.io
 import pandas as pd
+from sklearn.pipeline import Pipeline
 import tensorflow as tf
 import matplotlib.pyplot as plt
 import traceback
@@ -47,14 +45,23 @@ from sklearn.ensemble import VotingClassifier, VotingRegressor
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 
+import sys
+
+sys.path.insert(0,'/home/isampaio/Desktop/Ines/DRL_site/neurocombat_pyClasse/combat model/')
+import Confounder_Correction_Classes
+from Confounder_Correction_Classes import ComBatHarmonization, StandardScalerDict, BiocovariatesRegression
+
 
 data_folder = "/mnt/datafast/ines/pronia_fc/FC_matrices/"
 info_data_path = "/mnt/datafast/ines/pronia_fc/pronia_dataset_new.mat"
 diag_labels_path = "/mnt/datafast/ines/pronia_fc/diag_dummy.mat"
 
-save_results = "results/fusion_z_site_xcov_15_05_26/"
+save_results = "results/fc_z_site_xcov_15_05_26/"
 os.makedirs(save_results, exist_ok=True)
-output_base_name = "fusion_z_site_xcov_h1_gamma100_alphabeta1_jointopt"
+
+output_base_name = "fc_z_site_combat_without_cov_sex_lr"
+use_combat_without_cov = True # If True, we fit combat without covariates 
+
 
 seed_value = 2020
 batch_size = 128
@@ -62,9 +69,6 @@ epochs = 2000
 initial_learning_rate = 0.0001
 final_learning_rate = 0.00001
 learning_rate_decay_factor = (final_learning_rate / initial_learning_rate) ** (1 / epochs)
-gamma_xcov = 100.0 #15
-alpha = 1.0
-beta = 1.0
 random_state = [42, 24]
 start = [0, 5]
 
@@ -98,33 +102,15 @@ def _load_data():
     ]
 
     stacked_fc_matrices = np.zeros((num_subj, num_rois, num_rois), dtype=np.float32)
+    FC_dataset = np.zeros((num_subj, 12720))
+
     for i, mat in enumerate(fc_matrices[:num_subj]):
         stacked_fc_matrices[i, :, :] = mat
+        ind=np.flatnonzero(np.triu(fc_matrices[i],k=1))
+        FC_dataset[i,:] = np.triu(fc_matrices[i],k=1).flatten()[ind]
 
-    return stacked_fc_matrices, covariates, labels, envir, bs_with_nan
+    return stacked_fc_matrices, FC_dataset, covariates, labels, envir, bs_with_nan
 
-
-
-def _xcov_loss(z, y_pred, n_batch_size):
-    
-    y_pred_mean_over_batches=tf.reduce_mean(y_pred,axis=0, keepdims=True)
-    z_mean_over_batches=tf.reduce_mean(z, axis=0, keepdims=True) # should do the mean over all subjects in batch
-        
-    z_flatten = tf.keras.layers.Flatten()(z-z_mean_over_batches)
-    z_conf_flatten = (y_pred-y_pred_mean_over_batches)
-        
-    #tf.matmul does (n_batch,n_classes)x(n_batch,n_lantent_feat) -> (n_classes, n_latent_feat): each cell in this
-    # matrix has come from (class_11 * feat_11 + class_12 * feat_12 + ... + class_1N * feat_1N )
-    # so each matrix entry is the summation of multiplication of feature i and class i for n_batches 
-    # each cell must be then divided by N_batches
-    xcov_loss = 0.5*tf.reduce_sum(tf.square(tf.matmul(z_conf_flatten,
-                                                      z_flatten,
-                                                      transpose_a=True
-                                                    ) / n_batch_size
-                                           )
-                             )
-                    
-    return xcov_loss
 
 
 
@@ -210,13 +196,12 @@ def _build_models(num_classes):
     x = Conv2D(32, (3, 3), activation="selu", kernel_initializer="lecun_normal", padding="same")(x)
     x = MaxPooling2D((2, 2), padding="same")(x)
     x = Conv2D(64, (3, 3), activation="selu", kernel_initializer="lecun_normal", padding="same")(x)
-    x = MaxPooling2D((2, 2), padding="same")(x)
-    x = Conv2D(128, (3, 3), strides=1, activation="selu", kernel_initializer="lecun_normal", padding="same")(x)
+    h1_layer = MaxPooling2D((2, 2), padding="same")(x)
+    x = Conv2D(128, (3, 3), strides=1, activation="selu", kernel_initializer="lecun_normal", padding="same")(h1_layer)
     fc_encoded = MaxPooling2D((4, 4), padding="same")(x)
     fc_flatten = tf.keras.layers.Flatten()(fc_encoded)
+    FC_encoder = Model(input_matrix, fc_flatten, name="fc_encoder")
 
-    FC_encoder = Model(input_matrix, fc_flatten)
-    FC_encoder.summary()
 
 
     input_array = Input(shape=(23, 1))
@@ -231,32 +216,14 @@ def _build_models(num_classes):
 
     env_input = Input(shape=(env_flatten.shape[1],))
     fc_input = Input(shape=(fc_flatten.shape[1],))
-
     concat_flatten = Concatenate(axis=1)([fc_input, env_input])
-    h1_layer = Dense(256, activation="selu", kernel_initializer="lecun_normal")(concat_flatten)
-    x = Dropout(0.3)(h1_layer)
+    x = Dense(256, activation="selu", kernel_initializer="lecun_normal")(concat_flatten)
+    x = Dropout(0.3)(x)
     z_merged = Dense(128, activation="selu", kernel_initializer="lecun_normal")(x)
-
-    if num_classes > 1:
-        af = "softmax"
-        loss_sup = tf.keras.losses.CategoricalCrossentropy()
-    else:
-        af = "sigmoid"
-        loss_sup = tf.keras.losses.BinaryCrossentropy()
-
-    x = tf.keras.layers.Flatten()(h1_layer) #fc_encoded)
-    x = BatchNormalization()(x)
-    x = Dropout(0.5)(x)
-    supervised_output = Dense(num_classes, activation=af, kernel_regularizer=l2(0.01))(x)
-    
-    fusion = Model([fc_input,env_input], [z_merged, h1_layer, supervised_output], name="fusion_branch")
-    fusion.summary()
-
+    fusion = Model([fc_input, env_input], z_merged, name="fusion_branch")
 
     latent_inputs = Input(shape=(z_merged.shape[1],), name="z_merged_latent_inputs")
-    y_hat_inputs = Input(shape=(num_classes,), name="y_inputs")
-    concat_inputs = Concatenate(axis=1)([latent_inputs, y_hat_inputs])
-    x = Dense(3200, activation="selu", kernel_initializer="lecun_normal")(concat_inputs)
+    x = Dense(3200, activation="selu", kernel_initializer="lecun_normal")(latent_inputs)
     x = Reshape((5, 5, 128))(x)
     x = UpSampling2D((4, 4))(x)
     x = Conv2D(64, (3, 3), strides=1, activation="selu", kernel_initializer="lecun_normal", padding="same")(x)
@@ -266,47 +233,40 @@ def _build_models(num_classes):
     x = Conv2D(16, (3, 3), activation="selu", kernel_initializer="lecun_normal", padding="same")(x)
     x = UpSampling2D((2, 2))(x)
     decoded = Conv2D(1, (3, 3), activation="selu", kernel_initializer="lecun_normal", padding="same")(x)
-    fc_decoder = Model([latent_inputs, y_hat_inputs], decoded, name="decoded")
+    fc_decoder = Model(latent_inputs, decoded, name="decoded")
 
     latent_inputs = Input(shape=(z_merged.shape[1],), name="z_merged_latent_inputs")
-    y_hat_inputs = Input(shape=(num_classes,), name='y_inputs')
-    concat_inputs = Concatenate(axis=1)([latent_inputs, y_hat_inputs ])
-    x = Dense(120, activation="selu", kernel_initializer="lecun_normal")(concat_inputs)
+    x = Dense(120, activation="selu", kernel_initializer="lecun_normal")(latent_inputs)
     x = Reshape((6, 20))(x)
     x = UpSampling1D(size=2)(x)
     x = Conv1D(20, 5, activation="selu", kernel_initializer="lecun_normal", strides=1, padding="same")(x)
     x = BatchNormalization()(x)
     x = Conv1DTranspose(1, 7, activation="selu", kernel_initializer="lecun_normal", strides=2, padding="same")(x)
     env_decoded = Cropping1D((0, 1))(x)
-    env_decoder = Model([latent_inputs, y_hat_inputs], env_decoded, name="env_decoded")
+    env_decoder = Model(latent_inputs, env_decoded, name="env_decoded")
 
-    return FC_encoder, ENV_encoder, fusion, fc_decoder, env_decoder, loss_sup
+    return FC_encoder, ENV_encoder, fusion, fc_decoder, env_decoder,
 
 
 class AE(tf.keras.Model):
-    def __init__(self, FC_encoder, fc_decoder, ENV_encoder, env_decoder, fusion, loss_sup, n_batch_size, alpha=1.0, gamma=1.0, **kwargs):
+    def __init__(self, FC_encoder, fc_decoder, ENV_encoder, env_decoder, fusion, **kwargs):
         super().__init__(**kwargs)
         self.FC_encoder = FC_encoder
         self.fc_decoder = fc_decoder
         self.ENV_encoder = ENV_encoder
         self.env_decoder = env_decoder
         self.fusion = fusion
-        self.loss_sup = loss_sup
-        self.n_batch_size = n_batch_size
-        self.alpha = alpha
-        self.gamma = gamma
-        self.beta = beta
+
+
 
         self.total_loss_tracker = tf.keras.metrics.Mean(name="loss")
         self.fc_reconstruction_loss_tracker = tf.keras.metrics.Mean(name="fc_reconstruction_loss")
         self.env_reconstruction_loss_tracker = tf.keras.metrics.Mean(name="env_reconstruction_loss")
-        self.xcov_loss_tracker = tf.keras.metrics.Mean(name="xcov_loss")
-        self.clf_loss_tracker = tf.keras.metrics.Mean(name="clf_loss")
 
     def compile(self, optimizer_ae, jit_compile=False): #optimizer_clf
         super().compile(jit_compile=jit_compile)
         self.optimizer_ae = optimizer_ae
-        #self.optimizer_clf = optimizer_clf
+
 
     @property
     def metrics(self):
@@ -314,99 +274,92 @@ class AE(tf.keras.Model):
             self.total_loss_tracker,
             self.fc_reconstruction_loss_tracker,
             self.env_reconstruction_loss_tracker,
-            self.xcov_loss_tracker,
-            self.clf_loss_tracker,
         ]
 
     def train_step(self, data):
-        x, y = data
-        fc, env = x
+        # Handle both cases: with and without labels
+        if isinstance(data, tuple):
+            x = data[0]  # data is (inputs, labels) or (inputs,)
+        else:
+            x = data
+        
+        fc, env = x[0], x[1]
 
         with tf.GradientTape() as tape:
-
-            fc_z  = self.FC_encoder(fc, training=True)
+            fc_z = self.FC_encoder(fc, training=True)
+            
             env_z = self.ENV_encoder(env, training=True)
-            z, _ ,y_pred = self.fusion([fc_z, env_z], training=True)
-
-            fc_reconstruction = self.fc_decoder([z, y_pred], training=True)
-            env_reconstruction = self.env_decoder([z, y_pred], training=True)
+            z = self.fusion([fc_z, env_z], training=True)
+            fc_reconstruction = self.fc_decoder(z, training=True)
+            env_reconstruction = self.env_decoder(z, training=True)
 
             re_loss = tf.keras.losses.MeanSquaredError(reduction="sum_over_batch_size")
             fc_reconstruction_loss = re_loss(fc, fc_reconstruction)
             env_reconstruction_loss = re_loss(env, env_reconstruction)
 
-            clf_loss = self.loss_sup(y, y_pred)
 
-            xcov_loss = _xcov_loss(z, y_pred, self.n_batch_size)
-
-            total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss +  self.gamma * xcov_loss
+            total_loss = fc_reconstruction_loss + env_reconstruction_loss
 
         grads = tape.gradient(total_loss, self.trainable_weights)
         self.optimizer_ae.apply_gradients(zip(grads, self.trainable_weights))
         self.total_loss_tracker.update_state(total_loss)
         self.fc_reconstruction_loss_tracker.update_state(fc_reconstruction_loss)
         self.env_reconstruction_loss_tracker.update_state(env_reconstruction_loss)
-        self.xcov_loss_tracker.update_state(xcov_loss)
-        self.clf_loss_tracker.update_state(clf_loss)
 
         return {
             "loss": self.total_loss_tracker.result(),
             "fc_reconstruction_loss": self.fc_reconstruction_loss_tracker.result(),
             "env_reconstruction_loss": self.env_reconstruction_loss_tracker.result(),
-            "xcov_loss": self.xcov_loss_tracker.result(),
-            "clf_loss": self.clf_loss_tracker.result(),
         }
 
     def test_step(self, data):
-        x, y = data
+        x = data
         fc, env = x
 
-        fc_z  = self.FC_encoder(fc, training=False)
+        fc_z = self.FC_encoder(fc, training=False)
         env_z = self.ENV_encoder(env, training=False)
-        z, _ ,y_pred = self.fusion([fc_z, env_z], training=False)
-        fc_reconstruction = self.fc_decoder([z, y_pred], training=False)
-        env_reconstruction = self.env_decoder([z, y_pred], training=False)
+        z = self.fusion([fc_z, env_z], training=False)
+        fc_reconstruction = self.fc_decoder(z, training=False)
+        env_reconstruction = self.env_decoder(z, training=False)
 
         re_loss = tf.keras.losses.MeanSquaredError(reduction="sum_over_batch_size")
         fc_reconstruction_loss = re_loss(fc, fc_reconstruction)
         env_reconstruction_loss = re_loss(env, env_reconstruction)
 
-        clf_loss = self.loss_sup(y, y_pred)
-
-        xcov_loss = _xcov_loss(z, y_pred, self.n_batch_size)
-        total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss +  self.gamma * xcov_loss
+        total_loss = fc_reconstruction_loss + env_reconstruction_loss
 
         self.total_loss_tracker.update_state(total_loss)
         self.fc_reconstruction_loss_tracker.update_state(fc_reconstruction_loss)
         self.env_reconstruction_loss_tracker.update_state(env_reconstruction_loss)
-        self.xcov_loss_tracker.update_state(xcov_loss)
-        self.clf_loss_tracker.update_state(clf_loss)
+
 
         return {
             "loss": self.total_loss_tracker.result(),
             "fc_reconstruction_loss": self.fc_reconstruction_loss_tracker.result(),
             "env_reconstruction_loss": self.env_reconstruction_loss_tracker.result(),
-            "xcov_loss": self.xcov_loss_tracker.result(),
-            "clf_loss": self.clf_loss_tracker.result(),
         }
 
 
 
 def main():
-    stacked_fc_matrices, covariates, labels, envir, bs_with_nan = _load_data()
+    stacked_fc_matrices, fc_dataset, covariates, labels, envir, bs_with_nan = _load_data()
+
+    sites_array = pd.DataFrame(covariates[:,3:]).idxmax(axis=1)
+
+    # Name the covariates columns
+    cov_matrix = pd.DataFrame(covariates[:,0:3],columns=['Age', 'Sex', 'Education'])
+    cov_matrix = pd.concat([cov_matrix, sites_array],axis=1).rename({0: 'batch'},axis=1)
+    cov_matrix = pd.concat([cov_matrix, labels.idxmax(axis=1)],axis=1).rename({0: 'Diagn'},axis=1) #.rename({0: 'HC', 1: 'CHR', 2: 'ROD', 3: 'ROP'},axis=1)
+
 
     result_columns = [
         "epochs",
         "loss",
         "fc_reconstruction_loss",
         "env_reconstruction_loss",
-        "xcov_loss",
-        "clf_loss",
         "val_loss",
         "val_fc_reconstruction_loss",
         "val_env_reconstruction_loss",
-        "val_xcov_loss",
-        "val_clf_loss",
         "val_re_rmse",
         "train_sym_rmse",
         "val_sym_rmse",
@@ -481,8 +434,6 @@ def main():
         "fc_z_Age_mlp_rmse",
         "env_z_Age_mlp_rmse",
         "z_ERS_rmse",
-        "softmax_site_auc_roc",
-        "softmax_site_f1",
         # Cross-site generalizability metrics (site 1 as test, rest as train)
         "z_Sex_xsite_auc_roc",
         "z_Sex_xsite_f1",
@@ -525,16 +476,44 @@ def main():
             fold_idx = start[r] + i
             print(fold_idx)
 
-            X_train = stacked_fc_matrices[train_ind, :, :]
-            X_val = stacked_fc_matrices[val_ind, :, :]
-            cov_train = covariates[train_ind, :]
-            cov_val = covariates[val_ind, :]
+            X_train = fc_dataset[train_ind, :]
+            X_val = fc_dataset[val_ind, :]
+
+            cov_train = cov_matrix.iloc[train_ind, :].reset_index()
+            cov_val = cov_matrix.iloc[val_ind, :].reset_index()
+
             env_train = envir[train_ind, :].copy()
             env_val = envir[val_ind, :].copy()
+
             labels_train = labels.iloc[train_ind, :]
             labels_val = labels.iloc[val_ind, :]
+
             bs_train = bs_with_nan[train_ind, :].copy()
             bs_val = bs_with_nan[val_ind, :].copy()
+
+            # Re-order the sites ID - needed for combat
+        
+            # Training set
+            cov_train = cov_train.sort_values('batch')
+            train_combat_order = list(cov_train.index) # The list of original indexes in the new sorted order
+            y_train_sites = cov_train['batch'].values
+            cov_train.reset_index(inplace=True)
+            env_train=env_train[train_combat_order, :]
+            labels_train = labels_train.iloc[train_combat_order, :].reset_index(drop=True)
+            bs_train = bs_with_nan[train_combat_order,:]
+        
+            X_train = X_train[train_combat_order, :]
+        
+            # Validation set
+            cov_val = cov_val.sort_values('batch')
+            val_combat_order = list(cov_val.index) # The list of original indexes in the new sorted order
+            y_val_sites = cov_val['batch'].values.astype(str)
+            cov_val.reset_index(inplace=True)
+            env_val = env_val[val_combat_order, :]
+            labels_val = labels_val.iloc[val_combat_order, :].reset_index(drop=True)
+            bs_val = bs_with_nan[val_combat_order,:]
+        
+            X_val = X_val[val_combat_order, :]
 
             col_mean = np.nanmean(bs_train, axis=0)
             inds = np.where(np.isnan(bs_train))
@@ -546,33 +525,122 @@ def main():
             train_env_risk = np.sum(env_train, axis=1) / max_score_per_subject
             val_env_risk = np.sum(env_val, axis=1) / max_score_per_subject
 
-            y_train_multiclass = cov_train[:, 3:].copy()
-            y_val_multiclass = cov_val[:, 3:].copy()
+            y_train_multiclass = pd.get_dummies(cov_train, columns=['batch'], drop_first=False, dtype=int).iloc[:,6:].copy()
+            y_val_multiclass = pd.get_dummies(cov_val, columns=['batch'], drop_first=False, dtype=int).iloc[:,6:].copy()
+
             num_classes = y_train_multiclass.shape[1]
+
+            ###_______________________ COMBAT HARMONIZATION________________________________
+
+            num_feat = X_train.shape[1]
+            features = np.arange(0, num_feat)
+
+            if use_combat_without_cov==True:
+
+                feat_to_harm = {'fc': {'id': features, 'categorical': [],
+                               'continuous': []}}
+
+            else:
+                feat_to_harm = {'fc': {'id': features, 'categorical': ['Sex'], #'Diagn_0'
+                               'continuous': ['Age']}}
+                
+            biocov_to_rem = {'fc': {'id': features, 'categorical': ['Sex'],
+                            'continuous': []}}
+        
+            combat = ComBatHarmonization(cv_method=None, ref_batch=None, 
+                                     regression_fit=1, feat_detail=feat_to_harm, 
+                                     feat_of_no_interest=None)
+            
+            biocov_regre=BiocovariatesRegression(ref_batch=None,cv_method=None,
+                                                feat_detail=biocov_to_rem,
+                                                output_dict=False)
+
+            combat_biocovregr_steps = [('Multi-center features Harmonization', combat),
+                                       ('Confounder Regression', biocov_regre)]
+            preprocessing_pipeline = Pipeline(combat_biocovregr_steps)
+
+            X_train_dict={'data': X_train , 'covariates': pd.get_dummies(cov_train, columns=['Diagn'], drop_first=False, dtype=int)}
+        
+            X_val_dict={'data': X_val , 'covariates': pd.get_dummies(cov_val, columns=['Diagn'], drop_first=False, dtype=int)}
+        
+            X_train_harm = preprocessing_pipeline.fit_transform(X_train_dict)
+        
+            X_val_harm = preprocessing_pipeline.transform(X_val_dict) # We don't fit combat in training set to avoid dataleakage
+
+            # RECONSTRUCT FC MATRIX
+        
+            ## Training set 
+        
+            num_ROI = 160
+            n_train = X_train_harm.shape[0]
+        
+            X_train = np.zeros((n_train,num_ROI, num_ROI))
+            corr_matrix=np.zeros((num_ROI, num_ROI))
+
+            for m in range(n_train):
+            
+                conn_vector = X_train_harm[m,:]
+            
+                corr_matrix[0,1:num_ROI]=conn_vector[-num_ROI+1:]
+            
+                last = -num_ROI+1
+                final = -num_ROI+1
+                for j in range(1,num_ROI-1):
+                
+                    initial = last
+                    final = final + (-num_ROI+1+j)
+                
+                    corr_matrix[j, j+1:num_ROI] = conn_vector[final:initial]
+                
+                    last = final
+            
+                corr_matrix_=corr_matrix + corr_matrix.T - np.diag(np.diag(corr_matrix))
+                X_train[m,:,:] = corr_matrix_
+        
+            ## Validation set
+            n_val = X_val_harm.shape[0]
+        
+            X_val = np.zeros((n_val,num_ROI, num_ROI))
+            corr_matrix=np.zeros((num_ROI, num_ROI))
+
+            for m in range(n_val):
+            
+                conn_vector = X_val_harm[m,:]
+            
+                corr_matrix[0,1:num_ROI]=conn_vector[-num_ROI+1:]
+            
+                last = -num_ROI+1
+                final = -num_ROI+1
+                for j in range(1,num_ROI-1):
+                
+                    initial = last
+                    final = final + (-num_ROI+1+j)
+                
+                    corr_matrix[j, j+1:num_ROI] = conn_vector[final:initial]
+                
+                    last = final
+            
+                corr_matrix_=corr_matrix + corr_matrix.T - np.diag(np.diag(corr_matrix))
+                X_val[m,:,:] = corr_matrix_
+            
+        
+            # Initialize model
+        
+
 
             np.random.seed(seed_value)
             tf.random.set_seed(seed_value)
 
-            FC_encoder, ENV_encoder, fusion, fc_decoder, env_decoder, loss_sup = _build_models(num_classes)
+            FC_encoder, ENV_encoder, fusion, fc_decoder, env_decoder  = _build_models(num_classes)
 
-            steps_per_epoch = max(1, int(X_train.shape[0] / batch_size))
-            lrs = tf.keras.optimizers.schedules.ExponentialDecay(
-                initial_learning_rate,
-                steps_per_epoch,
-                learning_rate_decay_factor,
-                staircase=False,
-            )
+
 
             autoencoder_2 = AE(
                 FC_encoder,
                 fc_decoder,
                 ENV_encoder,
                 env_decoder,
-                fusion,
-                loss_sup,
-                batch_size,
-                alpha=alpha,
-                gamma=gamma_xcov,
+                fusion
             )
 
             autoencoder_2.compile(
@@ -581,12 +649,11 @@ def main():
             )
 
             autoencoder_2.fit(
-                x=[X_train, env_train],
-                y=y_train_multiclass,
+                [X_train, env_train],
                 epochs=epochs,
                 batch_size=batch_size,
                 shuffle=True,
-                validation_data=([X_val, env_val], y_val_multiclass),
+                validation_data=[X_val, env_val],
                 verbose=1,
             )
 
@@ -596,15 +663,11 @@ def main():
             val_fc_loss = autoencoder_2.history.history["val_fc_reconstruction_loss"]
             train_env_loss = autoencoder_2.history.history["env_reconstruction_loss"]
             val_env_loss = autoencoder_2.history.history["val_env_reconstruction_loss"]
-            train_xcov_loss = autoencoder_2.history.history["xcov_loss"]
-            val_xcov_loss = autoencoder_2.history.history["val_xcov_loss"]
-            train_clf_loss = autoencoder_2.history.history["clf_loss"]
-            val_clf_loss = autoencoder_2.history.history["val_clf_loss"]
 
             # Save loss evolution plot for first fold only
             if fold_idx == start[0]:
                 epochs_range = range(1, len(train_loss) + 1)
-                fig, axes = plt.subplots(5, 1, figsize=(12, 16))
+                fig, axes = plt.subplots(3, 1, figsize=(12, 16))
                 
                 axes[0].plot(epochs_range, train_loss, "b-", label="Train", linewidth=1.5)
                 axes[0].plot(epochs_range, val_loss, "r-", label="Validation", linewidth=1.5)
@@ -627,21 +690,6 @@ def main():
                 axes[2].legend()
                 axes[2].grid(True, alpha=0.3)
                 
-                axes[3].plot(epochs_range, train_xcov_loss, "b-", label="Train", linewidth=1.5)
-                axes[3].plot(epochs_range, val_xcov_loss, "r-", label="Validation", linewidth=1.5)
-                axes[3].set_ylabel("XCov Loss")
-                axes[3].set_title(f"XCov Loss - Fold {fold_idx}")
-                axes[3].legend()
-                axes[3].grid(True, alpha=0.3)
-                
-                axes[4].plot(epochs_range, train_clf_loss, "b-", label="Train", linewidth=1.5)
-                axes[4].plot(epochs_range, val_clf_loss, "r-", label="Validation", linewidth=1.5)
-                axes[4].set_xlabel("Epoch")
-                axes[4].set_ylabel("Classification Loss")
-                axes[4].set_title(f"Classification Loss - Fold {fold_idx}")
-                axes[4].legend()
-                axes[4].grid(True, alpha=0.3)
-                
                 plt.tight_layout()
                 plot_path = os.path.join(save_results, f"{output_base_name}_losses.png")
                 plt.savefig(plot_path, dpi=100)
@@ -651,18 +699,16 @@ def main():
 
             fc_train_encoded = FC_encoder.predict(X_train, verbose=0)
             env_train_encoded = ENV_encoder.predict(env_train, verbose=0)
-            z_train, h1_train, y_train_sites_pred = fusion.predict([fc_train_encoded, env_train_encoded], verbose=0)
+            z_train = fusion.predict([fc_train_encoded, env_train_encoded], verbose=0)
+            fc_train_decoded = fc_decoder.predict(z_train, verbose=0)
 
-            fc_train_decoded = fc_decoder.predict([z_train, y_train_sites_pred], verbose=0)
-
-            fc_val_encoded  = FC_encoder.predict(X_val, verbose=0)
+            fc_val_encoded = FC_encoder.predict(X_val, verbose=0)
             env_val_encoded = ENV_encoder.predict(env_val, verbose=0)
-            z_val, h1_val, y_val_sites_pred = fusion.predict([fc_val_encoded, env_val_encoded], verbose=0)
-            
-            fc_val_decoded = fc_decoder.predict([z_val, y_val_sites_pred], verbose=0)
+            z_val = fusion.predict([fc_val_encoded, env_val_encoded], verbose=0)
+            fc_val_decoded = fc_decoder.predict(z_val, verbose=0)
 
-            y_train_sites = pd.DataFrame(y_train_multiclass).idxmax(axis=1).values
-            y_val_sites = pd.DataFrame(y_val_multiclass).idxmax(axis=1).values
+            y_train_sites = pd.DataFrame(y_train_multiclass.to_numpy()).idxmax(axis=1).values
+            y_val_sites =  pd.DataFrame(y_val_multiclass.to_numpy()).idxmax(axis=1).values
             sites = np.unique(y_train_sites)
 
             fold_result = {column: np.nan for column in result_columns}
@@ -670,13 +716,10 @@ def main():
             fold_result["loss"] = train_loss[-1]
             fold_result["fc_reconstruction_loss"] = train_fc_loss[-1]
             fold_result["env_reconstruction_loss"] = train_env_loss[-1]
-            fold_result["xcov_loss"] = train_xcov_loss[-1]
-            fold_result["clf_loss"] = train_clf_loss[-1]
             fold_result["val_loss"] = val_loss[-1]
             fold_result["val_fc_reconstruction_loss"] = val_fc_loss[-1]
             fold_result["val_env_reconstruction_loss"] = val_env_loss[-1]
-            fold_result["val_xcov_loss"] = val_xcov_loss[-1]
-            fold_result["val_clf_loss"] = val_clf_loss[-1]
+
 
             X_val_flatten = X_val.reshape(X_val.shape[0], -1)
             fold_result["val_re_rmse"] = mean_squared_error(X_val_flatten, fc_val_decoded.reshape(X_val.shape[0], -1), squared=False)
@@ -688,13 +731,6 @@ def main():
             triu = np.triu(fc_val_decoded[:, :, :, 0])
             fold_result["val_sym_rmse"] = mean_squared_error(triu[0, :, :].T, tril[0, :, :], squared=False)
 
-            try:
-                auc, f1 = _safe_auc_f1_multiclass(y_val_multiclass, y_val_sites_pred, sites)
-                fold_result["softmax_site_auc_roc"] = auc
-                fold_result["softmax_site_f1"] = f1
-            except Exception as e:
-                print(f"ERROR in softmax site classification (fold {fold_idx}): {e}")
-                traceback.print_exc()
 
             # Site classification
             for prefix, Xtr, Xva in [
@@ -721,12 +757,18 @@ def main():
                         hidden_layers=(128,),
                         max_iter=300,
                     )
-                    auc, f1 = _safe_auc_f1_multiclass(y_val_multiclass, y_prob, sites)
+                    auc, f1 = _safe_auc_f1_multiclass(y_val_multiclass.to_numpy(), y_prob, sites)
                     fold_result[f"{prefix}_site_mlp_auc_roc"] = auc
                     fold_result[f"{prefix}_site_mlp_f1"] = f1
                 except Exception as e:
                     print(f"ERROR in {prefix} MLP site classification (fold {fold_idx}): {e}")
                     traceback.print_exc()
+                    raise  # This stops the script
+                    
+
+            # Transform cov to numpy
+            cov_train = cov_train.iloc[:,2:].to_numpy()
+            cov_val = cov_val.iloc[:,2:].to_numpy()
 
             # Sex classification
             y_train_binary = cov_train[:, 1].astype("float32").reshape((-1, 1))

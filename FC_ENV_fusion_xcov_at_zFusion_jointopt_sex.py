@@ -54,7 +54,7 @@ diag_labels_path = "/mnt/datafast/ines/pronia_fc/diag_dummy.mat"
 
 save_results = "results/fusion_z_site_xcov_15_05_26/"
 os.makedirs(save_results, exist_ok=True)
-output_base_name = "fusion_z_site_xcov_h1_gamma100_alphabeta1_jointopt"
+output_base_name = "fusion_z_site_xcov_h1_gamma100_alphabeta1_jointopt_sex"
 
 seed_value = 2020
 batch_size = 128
@@ -202,7 +202,7 @@ def _safe_auc_f1_multiclass(y_true_onehot, y_pred_proba, labels_for_f1):
 
 
 
-def _build_models(num_classes):
+def _build_models(num_classes, num_classes_sex):
     input_matrix = Input(shape=(160, 160, 1))
     x = input_matrix
     x = Conv2D(16, (3, 3), data_format="channels_last", activation="selu", kernel_initializer="lecun_normal", padding="same", kernel_regularizer=l2(0.1))(x)
@@ -249,13 +249,31 @@ def _build_models(num_classes):
     x = Dropout(0.5)(x)
     supervised_output = Dense(num_classes, activation=af, kernel_regularizer=l2(0.01))(x)
     
-    fusion = Model([fc_input,env_input], [z_merged, h1_layer, supervised_output], name="fusion_branch")
+    if num_classes_sex > 1:
+        af = "softmax"
+        loss_sup_sex = tf.keras.losses.CategoricalCrossentropy()
+    else:
+        af = "sigmoid"
+        loss_sup_sex = tf.keras.losses.BinaryCrossentropy()
+
+    # Sex disentanglement block
+    x2 = tf.keras.layers.Flatten()(h1_layer)
+    x2=BatchNormalization()(x2)
+    x2=Dropout(0.5)(x2)
+    #x2 = Dense(128, activation='selu', kernel_initializer="lecun_normal",  kernel_regularizer=l2(0.05))(x2)
+    #x2=Dropout(0.5)(x2)
+    supervised_output_sex = Dense(num_classes_sex, activation='softmax', kernel_regularizer=l2(0.05))(x2)
+        
+
+    fusion = Model([fc_input,env_input], [z_merged, h1_layer, supervised_output, supervised_output_sex], name="fusion_branch")
     fusion.summary()
 
 
     latent_inputs = Input(shape=(z_merged.shape[1],), name="z_merged_latent_inputs")
     y_hat_inputs = Input(shape=(num_classes,), name="y_inputs")
-    concat_inputs = Concatenate(axis=1)([latent_inputs, y_hat_inputs])
+    y_hat_sex_inputs = Input(shape=(num_classes_sex,), name="y_sex_inputs")
+
+    concat_inputs = Concatenate(axis=1)([latent_inputs, y_hat_inputs, y_hat_sex_inputs])
     x = Dense(3200, activation="selu", kernel_initializer="lecun_normal")(concat_inputs)
     x = Reshape((5, 5, 128))(x)
     x = UpSampling2D((4, 4))(x)
@@ -266,11 +284,11 @@ def _build_models(num_classes):
     x = Conv2D(16, (3, 3), activation="selu", kernel_initializer="lecun_normal", padding="same")(x)
     x = UpSampling2D((2, 2))(x)
     decoded = Conv2D(1, (3, 3), activation="selu", kernel_initializer="lecun_normal", padding="same")(x)
-    fc_decoder = Model([latent_inputs, y_hat_inputs], decoded, name="decoded")
+    fc_decoder = Model([latent_inputs, y_hat_inputs, y_hat_sex_inputs], decoded, name="decoded")
 
     latent_inputs = Input(shape=(z_merged.shape[1],), name="z_merged_latent_inputs")
     y_hat_inputs = Input(shape=(num_classes,), name='y_inputs')
-    concat_inputs = Concatenate(axis=1)([latent_inputs, y_hat_inputs ])
+    concat_inputs = Concatenate(axis=1)([latent_inputs, y_hat_inputs, y_hat_sex_inputs ])
     x = Dense(120, activation="selu", kernel_initializer="lecun_normal")(concat_inputs)
     x = Reshape((6, 20))(x)
     x = UpSampling1D(size=2)(x)
@@ -278,13 +296,13 @@ def _build_models(num_classes):
     x = BatchNormalization()(x)
     x = Conv1DTranspose(1, 7, activation="selu", kernel_initializer="lecun_normal", strides=2, padding="same")(x)
     env_decoded = Cropping1D((0, 1))(x)
-    env_decoder = Model([latent_inputs, y_hat_inputs], env_decoded, name="env_decoded")
+    env_decoder = Model([latent_inputs, y_hat_inputs, y_hat_sex_inputs], env_decoded, name="env_decoded")
 
-    return FC_encoder, ENV_encoder, fusion, fc_decoder, env_decoder, loss_sup
+    return FC_encoder, ENV_encoder, fusion, fc_decoder, env_decoder, loss_sup, loss_sup_sex
 
 
 class AE(tf.keras.Model):
-    def __init__(self, FC_encoder, fc_decoder, ENV_encoder, env_decoder, fusion, loss_sup, n_batch_size, alpha=1.0, gamma=1.0, **kwargs):
+    def __init__(self, FC_encoder, fc_decoder, ENV_encoder, env_decoder, fusion, loss_sup,loss_sup_sex, n_batch_size, alpha=1.0, gamma=1.0, **kwargs):
         super().__init__(**kwargs)
         self.FC_encoder = FC_encoder
         self.fc_decoder = fc_decoder
@@ -292,6 +310,7 @@ class AE(tf.keras.Model):
         self.env_decoder = env_decoder
         self.fusion = fusion
         self.loss_sup = loss_sup
+        self.loss_sup_sex = loss_sup_sex
         self.n_batch_size = n_batch_size
         self.alpha = alpha
         self.gamma = gamma
@@ -301,6 +320,8 @@ class AE(tf.keras.Model):
         self.fc_reconstruction_loss_tracker = tf.keras.metrics.Mean(name="fc_reconstruction_loss")
         self.env_reconstruction_loss_tracker = tf.keras.metrics.Mean(name="env_reconstruction_loss")
         self.xcov_loss_tracker = tf.keras.metrics.Mean(name="xcov_loss")
+        self.xcov_sex_loss_tracker = tf.keras.metrics.Mean(name="xcov_sex_loss")
+        self.clf_sex_loss_tracker = tf.keras.metrics.Mean(name="clf_sex_loss")
         self.clf_loss_tracker = tf.keras.metrics.Mean(name="clf_loss")
 
     def compile(self, optimizer_ae, jit_compile=False): #optimizer_clf
@@ -315,31 +336,36 @@ class AE(tf.keras.Model):
             self.fc_reconstruction_loss_tracker,
             self.env_reconstruction_loss_tracker,
             self.xcov_loss_tracker,
+            self.xcov_sex_loss_tracker,
+            self.clf_sex_loss_tracker,
             self.clf_loss_tracker,
         ]
 
     def train_step(self, data):
         x, y = data
         fc, env = x
+        y, y_sex_true = y
 
         with tf.GradientTape() as tape:
 
             fc_z  = self.FC_encoder(fc, training=True)
             env_z = self.ENV_encoder(env, training=True)
-            z, _ ,y_pred = self.fusion([fc_z, env_z], training=True)
+            z, _ ,y_pred, y_sex_pred = self.fusion([fc_z, env_z], training=True)
 
-            fc_reconstruction = self.fc_decoder([z, y_pred], training=True)
-            env_reconstruction = self.env_decoder([z, y_pred], training=True)
+            fc_reconstruction = self.fc_decoder([z, y_pred, y_sex_pred], training=True)
+            env_reconstruction = self.env_decoder([z, y_pred, y_sex_pred], training=True)
 
             re_loss = tf.keras.losses.MeanSquaredError(reduction="sum_over_batch_size")
             fc_reconstruction_loss = re_loss(fc, fc_reconstruction)
             env_reconstruction_loss = re_loss(env, env_reconstruction)
 
             clf_loss = self.loss_sup(y, y_pred)
+            clf_sex_loss = self.loss_sup_sex(y_sex_true, y_sex_pred)
 
             xcov_loss = _xcov_loss(z, y_pred, self.n_batch_size)
+            xcov_sex_loss = _xcov_loss(z, y_sex_pred, self.n_batch_size)
 
-            total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss +  self.gamma * xcov_loss
+            total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta* (clf_loss + clf_sex_loss) + self.gamma * (xcov_loss +  xcov_sex_loss)
 
         grads = tape.gradient(total_loss, self.trainable_weights)
         self.optimizer_ae.apply_gradients(zip(grads, self.trainable_weights))
@@ -347,47 +373,58 @@ class AE(tf.keras.Model):
         self.fc_reconstruction_loss_tracker.update_state(fc_reconstruction_loss)
         self.env_reconstruction_loss_tracker.update_state(env_reconstruction_loss)
         self.xcov_loss_tracker.update_state(xcov_loss)
+        self.xcov_sex_loss_tracker.update_state(xcov_sex_loss)
         self.clf_loss_tracker.update_state(clf_loss)
+        self.clf_sex_loss_tracker.update_state(clf_sex_loss)
 
         return {
             "loss": self.total_loss_tracker.result(),
             "fc_reconstruction_loss": self.fc_reconstruction_loss_tracker.result(),
             "env_reconstruction_loss": self.env_reconstruction_loss_tracker.result(),
             "xcov_loss": self.xcov_loss_tracker.result(),
+            "xcov_sex_loss": self.xcov_sex_loss_tracker.result(),
             "clf_loss": self.clf_loss_tracker.result(),
+            "clf_sex_loss": self.clf_sex_loss_tracker.result(),
         }
 
     def test_step(self, data):
         x, y = data
         fc, env = x
+        y, y_sex_true = y
 
         fc_z  = self.FC_encoder(fc, training=False)
         env_z = self.ENV_encoder(env, training=False)
-        z, _ ,y_pred = self.fusion([fc_z, env_z], training=False)
-        fc_reconstruction = self.fc_decoder([z, y_pred], training=False)
-        env_reconstruction = self.env_decoder([z, y_pred], training=False)
+        z, _ ,y_pred, y_sex_pred = self.fusion([fc_z, env_z], training=False)
+        fc_reconstruction = self.fc_decoder([z, y_pred, y_sex_pred], training=False)
+        env_reconstruction = self.env_decoder([z, y_pred, y_sex_pred], training=False)
 
         re_loss = tf.keras.losses.MeanSquaredError(reduction="sum_over_batch_size")
         fc_reconstruction_loss = re_loss(fc, fc_reconstruction)
         env_reconstruction_loss = re_loss(env, env_reconstruction)
 
         clf_loss = self.loss_sup(y, y_pred)
+        clf_sex_loss = self.loss_sup_sex(y_sex_true, y_sex_pred)
 
         xcov_loss = _xcov_loss(z, y_pred, self.n_batch_size)
-        total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta*clf_loss +  self.gamma * xcov_loss
+        xcov_sex_loss = _xcov_loss(z, y_sex_pred, self.n_batch_size)
+        total_loss = self.alpha * (fc_reconstruction_loss + env_reconstruction_loss) + self.beta* (clf_loss + clf_sex_loss) +  self.gamma * (xcov_loss + xcov_sex_loss)
 
         self.total_loss_tracker.update_state(total_loss)
         self.fc_reconstruction_loss_tracker.update_state(fc_reconstruction_loss)
         self.env_reconstruction_loss_tracker.update_state(env_reconstruction_loss)
         self.xcov_loss_tracker.update_state(xcov_loss)
+        self.xcov_sex_loss_tracker.update_state(xcov_sex_loss)
         self.clf_loss_tracker.update_state(clf_loss)
+        self.clf_sex_loss_tracker.update_state(clf_sex_loss)
 
         return {
             "loss": self.total_loss_tracker.result(),
             "fc_reconstruction_loss": self.fc_reconstruction_loss_tracker.result(),
             "env_reconstruction_loss": self.env_reconstruction_loss_tracker.result(),
             "xcov_loss": self.xcov_loss_tracker.result(),
+            "xcov_sex_loss": self.xcov_sex_loss_tracker.result(),
             "clf_loss": self.clf_loss_tracker.result(),
+            "clf_sex_loss": self.clf_sex_loss_tracker.result(),
         }
 
 
@@ -401,12 +438,16 @@ def main():
         "fc_reconstruction_loss",
         "env_reconstruction_loss",
         "xcov_loss",
+        "xcov_sex_loss",
         "clf_loss",
+        "clf_sex_loss",
         "val_loss",
         "val_fc_reconstruction_loss",
         "val_env_reconstruction_loss",
         "val_xcov_loss",
+        "val_xcov_sex_loss",
         "val_clf_loss",
+        "val_clf_sex_loss",
         "val_re_rmse",
         "train_sym_rmse",
         "val_sym_rmse",
@@ -549,11 +590,19 @@ def main():
             y_train_multiclass = cov_train[:, 3:].copy()
             y_val_multiclass = cov_val[:, 3:].copy()
             num_classes = y_train_multiclass.shape[1]
+            num_classes_sex = 2
+
+            # Sex labels (binary) - one-hot encoded
+            y_train_sex_raw = cov_train[:, 1].astype('float32')
+            y_val_sex_raw = cov_val[:, 1].astype('float32')
+            y_train_sex_multiclass = tf.keras.utils.to_categorical(y_train_sex_raw.astype(int), num_classes=2)
+            y_val_sex_multiclass = tf.keras.utils.to_categorical(y_val_sex_raw.astype(int), num_classes=2)
+            num_classes_sex = 2
 
             np.random.seed(seed_value)
             tf.random.set_seed(seed_value)
 
-            FC_encoder, ENV_encoder, fusion, fc_decoder, env_decoder, loss_sup = _build_models(num_classes)
+            FC_encoder, ENV_encoder, fusion, fc_decoder, env_decoder, loss_sup, loss_sup_sex = _build_models(num_classes, num_classes_sex)
 
             steps_per_epoch = max(1, int(X_train.shape[0] / batch_size))
             lrs = tf.keras.optimizers.schedules.ExponentialDecay(
@@ -570,6 +619,7 @@ def main():
                 env_decoder,
                 fusion,
                 loss_sup,
+                loss_sup_sex,
                 batch_size,
                 alpha=alpha,
                 gamma=gamma_xcov,
@@ -582,11 +632,11 @@ def main():
 
             autoencoder_2.fit(
                 x=[X_train, env_train],
-                y=y_train_multiclass,
+                y=[y_train_multiclass, y_train_sex_multiclass],
                 epochs=epochs,
                 batch_size=batch_size,
                 shuffle=True,
-                validation_data=([X_val, env_val], y_val_multiclass),
+                validation_data=([X_val, env_val], [y_val_multiclass, y_val_sex_multiclass]),
                 verbose=1,
             )
 
@@ -598,13 +648,17 @@ def main():
             val_env_loss = autoencoder_2.history.history["val_env_reconstruction_loss"]
             train_xcov_loss = autoencoder_2.history.history["xcov_loss"]
             val_xcov_loss = autoencoder_2.history.history["val_xcov_loss"]
+            train_xcov_sex_loss = autoencoder_2.history.history["xcov_sex_loss"]
+            val_xcov_sex_loss = autoencoder_2.history.history["val_xcov_sex_loss"]
             train_clf_loss = autoencoder_2.history.history["clf_loss"]
             val_clf_loss = autoencoder_2.history.history["val_clf_loss"]
+            train_clf_sex_loss = autoencoder_2.history.history["clf_sex_loss"]
+            val_clf_sex_loss = autoencoder_2.history.history["val_clf_sex_loss"]
 
             # Save loss evolution plot for first fold only
             if fold_idx == start[0]:
                 epochs_range = range(1, len(train_loss) + 1)
-                fig, axes = plt.subplots(5, 1, figsize=(12, 16))
+                fig, axes = plt.subplots(7, 1, figsize=(12, 20))
                 
                 axes[0].plot(epochs_range, train_loss, "b-", label="Train", linewidth=1.5)
                 axes[0].plot(epochs_range, val_loss, "r-", label="Validation", linewidth=1.5)
@@ -629,18 +683,32 @@ def main():
                 
                 axes[3].plot(epochs_range, train_xcov_loss, "b-", label="Train", linewidth=1.5)
                 axes[3].plot(epochs_range, val_xcov_loss, "r-", label="Validation", linewidth=1.5)
-                axes[3].set_ylabel("XCov Loss")
-                axes[3].set_title(f"XCov Loss - Fold {fold_idx}")
+                axes[3].set_ylabel("XCov Loss (Site)")
+                axes[3].set_title(f"XCov Loss (Site) - Fold {fold_idx}")
                 axes[3].legend()
                 axes[3].grid(True, alpha=0.3)
                 
-                axes[4].plot(epochs_range, train_clf_loss, "b-", label="Train", linewidth=1.5)
-                axes[4].plot(epochs_range, val_clf_loss, "r-", label="Validation", linewidth=1.5)
-                axes[4].set_xlabel("Epoch")
-                axes[4].set_ylabel("Classification Loss")
-                axes[4].set_title(f"Classification Loss - Fold {fold_idx}")
+                axes[4].plot(epochs_range, train_xcov_sex_loss, "b-", label="Train", linewidth=1.5)
+                axes[4].plot(epochs_range, val_xcov_sex_loss, "r-", label="Validation", linewidth=1.5)
+                axes[4].set_ylabel("XCov Loss (Sex)")
+                axes[4].set_title(f"XCov Loss (Sex) - Fold {fold_idx}")
                 axes[4].legend()
                 axes[4].grid(True, alpha=0.3)
+                
+                axes[5].plot(epochs_range, train_clf_loss, "b-", label="Train", linewidth=1.5)
+                axes[5].plot(epochs_range, val_clf_loss, "r-", label="Validation", linewidth=1.5)
+                axes[5].set_ylabel("Classification Loss (Site)")
+                axes[5].set_title(f"Classification Loss (Site) - Fold {fold_idx}")
+                axes[5].legend()
+                axes[5].grid(True, alpha=0.3)
+                
+                axes[6].plot(epochs_range, train_clf_sex_loss, "b-", label="Train", linewidth=1.5)
+                axes[6].plot(epochs_range, val_clf_sex_loss, "r-", label="Validation", linewidth=1.5)
+                axes[6].set_xlabel("Epoch")
+                axes[6].set_ylabel("Classification Loss (Sex)")
+                axes[6].set_title(f"Classification Loss (Sex) - Fold {fold_idx}")
+                axes[6].legend()
+                axes[6].grid(True, alpha=0.3)
                 
                 plt.tight_layout()
                 plot_path = os.path.join(save_results, f"{output_base_name}_losses.png")
@@ -651,15 +719,15 @@ def main():
 
             fc_train_encoded = FC_encoder.predict(X_train, verbose=0)
             env_train_encoded = ENV_encoder.predict(env_train, verbose=0)
-            z_train, h1_train, y_train_sites_pred = fusion.predict([fc_train_encoded, env_train_encoded], verbose=0)
+            z_train, h1_train, y_train_sites_pred, y_train_sex_pred = fusion.predict([fc_train_encoded, env_train_encoded], verbose=0)
 
-            fc_train_decoded = fc_decoder.predict([z_train, y_train_sites_pred], verbose=0)
+            fc_train_decoded = fc_decoder.predict([z_train, y_train_sites_pred, y_train_sex_pred], verbose=0)
 
             fc_val_encoded  = FC_encoder.predict(X_val, verbose=0)
             env_val_encoded = ENV_encoder.predict(env_val, verbose=0)
-            z_val, h1_val, y_val_sites_pred = fusion.predict([fc_val_encoded, env_val_encoded], verbose=0)
+            z_val, h1_val, y_val_sites_pred, y_val_sex_pred = fusion.predict([fc_val_encoded, env_val_encoded], verbose=0)
             
-            fc_val_decoded = fc_decoder.predict([z_val, y_val_sites_pred], verbose=0)
+            fc_val_decoded = fc_decoder.predict([z_val, y_val_sites_pred, y_val_sex_pred], verbose=0)
 
             y_train_sites = pd.DataFrame(y_train_multiclass).idxmax(axis=1).values
             y_val_sites = pd.DataFrame(y_val_multiclass).idxmax(axis=1).values
@@ -671,12 +739,16 @@ def main():
             fold_result["fc_reconstruction_loss"] = train_fc_loss[-1]
             fold_result["env_reconstruction_loss"] = train_env_loss[-1]
             fold_result["xcov_loss"] = train_xcov_loss[-1]
+            fold_result["xcov_sex_loss"] = train_xcov_sex_loss[-1]
             fold_result["clf_loss"] = train_clf_loss[-1]
+            fold_result["clf_sex_loss"] = train_clf_sex_loss[-1]
             fold_result["val_loss"] = val_loss[-1]
             fold_result["val_fc_reconstruction_loss"] = val_fc_loss[-1]
             fold_result["val_env_reconstruction_loss"] = val_env_loss[-1]
             fold_result["val_xcov_loss"] = val_xcov_loss[-1]
+            fold_result["val_xcov_sex_loss"] = val_xcov_sex_loss[-1]
             fold_result["val_clf_loss"] = val_clf_loss[-1]
+            fold_result["val_clf_sex_loss"] = val_clf_sex_loss[-1]
 
             X_val_flatten = X_val.reshape(X_val.shape[0], -1)
             fold_result["val_re_rmse"] = mean_squared_error(X_val_flatten, fc_val_decoded.reshape(X_val.shape[0], -1), squared=False)
